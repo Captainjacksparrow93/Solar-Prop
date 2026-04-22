@@ -88,10 +88,10 @@ export function LeadDetailClient({ lead, company }: Props) {
     company?.defaultPanelWattage ?? 400
   );
   const [electricityRate, setElectricityRate] = useState(
-    company?.defaultElectricityRate ?? 0.12
+    company?.defaultElectricityRate ?? 9.0
   );
   const [panelCostPerWatt, setPanelCostPerWatt] = useState(
-    company?.defaultPanelCostPerWatt ?? 2.5
+    company?.defaultPanelCostPerWatt ?? 45.0
   );
   const [incentivePercent, setIncentivePercent] = useState(
     company?.defaultIncentivePercent ?? 30
@@ -318,14 +318,14 @@ export function LeadDetailClient({ lead, company }: Props) {
                   className="w-full px-2 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-orange-500" />
               </div>
               <div>
-                <label className="block text-xs text-slate-400 mb-1">Electricity ($/kWh)</label>
-                <input type="number" min={0.01} max={1} step={0.01} value={electricityRate}
+                <label className="block text-xs text-slate-400 mb-1">Electricity (₹/kWh)</label>
+                <input type="number" min={1} max={50} step={0.5} value={electricityRate}
                   onChange={(e) => setElectricityRate(Number(e.target.value))}
                   className="w-full px-2 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-orange-500" />
               </div>
               <div>
-                <label className="block text-xs text-slate-400 mb-1">Install cost ($/W)</label>
-                <input type="number" min={0.5} max={10} step={0.1} value={panelCostPerWatt}
+                <label className="block text-xs text-slate-400 mb-1">Install cost (₹/W)</label>
+                <input type="number" min={20} max={200} step={1} value={panelCostPerWatt}
                   onChange={(e) => setPanelCostPerWatt(Number(e.target.value))}
                   className="w-full px-2 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-orange-500" />
               </div>

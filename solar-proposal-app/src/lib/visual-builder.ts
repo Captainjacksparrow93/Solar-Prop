@@ -109,92 +109,139 @@ function ptInPoly(px: number, py: number, poly: Array<{ x: number; y: number }>)
   return inside;
 }
 
-// ─── Roof detection from image pixels ────────────────────────────────────────
+// ─── Roof detection via flood-fill from image centre ─────────────────────────
+//
+// Strategy: the satellite image is centred exactly on the building's coordinates.
+// Starting from the centre pixel, we BFS-expand to adjacent pixels that have a
+// similar colour (within a Euclidean RGB distance tolerance).  The bounding box
+// of the filled region IS the building footprint.
+//
+// We try three tolerances in sequence and accept the first that gives a
+// plausible result (not too small, not flooding the entire ground).
+//
+// Why this beats variance blocks:
+//   • Variance blocks find ANY flat area (roads, car parks) — this starts from
+//     the building centre and expands along its actual colour.
+//   • Produces a different bounding box per building, not a generic rectangle.
+//   • Works on dark roofs, light roofs, red tiles, metal — any surface colour.
 
 interface RoofBounds { x: number; y: number; w: number; h: number }
 
 async function detectRoofBounds(satBuffer: Buffer, lat: number, roofAreaSqM: number | null): Promise<RoofBounds> {
-  // Analyse at 128×80 for speed
-  const SMALL_W = 128;
-  const SMALL_H = 80;
-  const BLOCK   = 8; // 16×10 = 160 blocks total
+  // Analysis resolution: 320×200 — fine enough to distinguish 5 m features at zoom 19
+  const AW = 320, AH = 200;
 
-  const { data: gray } = await sharp(satBuffer)
-    .resize(SMALL_W, SMALL_H)
-    .grayscale()
+  const { data: pixels } = await sharp(satBuffer)
+    .resize(AW, AH)
+    .removeAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  const bW = Math.floor(SMALL_W / BLOCK);
-  const bH = Math.floor(SMALL_H / BLOCK);
+  // Helper: RGB triplet at pixel (x, y)
+  function getRgb(x: number, y: number): [number, number, number] {
+    const i = (y * AW + x) * 3;
+    return [pixels[i], pixels[i + 1], pixels[i + 2]];
+  }
 
-  // Local variance per block
-  const variance: number[] = [];
-  for (let by = 0; by < bH; by++) {
-    for (let bx = 0; bx < bW; bx++) {
-      let sum = 0, sumSq = 0, n = 0;
-      for (let y = by * BLOCK; y < (by + 1) * BLOCK && y < SMALL_H; y++) {
-        for (let x = bx * BLOCK; x < (bx + 1) * BLOCK && x < SMALL_W; x++) {
-          const v = gray[y * SMALL_W + x];
-          sum += v; sumSq += v * v; n++;
+  // Euclidean distance in RGB space
+  function rgbDist(a: [number, number, number], b: [number, number, number]): number {
+    return Math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2);
+  }
+
+  // Sample a 3×3 patch around the image centre for a stable reference colour
+  const cx = Math.floor(AW / 2);
+  const cy = Math.floor(AH / 2);
+  let rSum = 0, gSum = 0, bSum = 0, nPx = 0;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const [r, g, b] = getRgb(cx + dx, cy + dy);
+      rSum += r; gSum += g; bSum += b; nPx++;
+    }
+  }
+  const refColor: [number, number, number] = [rSum / nPx, gSum / nPx, bSum / nPx];
+
+  // BFS flood fill — returns bounding box + pixel count
+  function floodFill(tolerance: number): { minX: number; minY: number; maxX: number; maxY: number; count: number } {
+    const visited = new Uint8Array(AW * AH);
+    // Use a flat index array as the queue for speed (avoid object allocations)
+    const q = new Int32Array(AW * AH);
+    let qHead = 0, qTail = 0;
+
+    const startIdx = cy * AW + cx;
+    visited[startIdx] = 1;
+    q[qTail++] = startIdx;
+
+    let minX = cx, maxX = cx, minY = cy, maxY = cy;
+
+    const DX = [-1, 1, 0, 0];
+    const DY = [0, 0, -1, 1];
+
+    while (qHead < qTail) {
+      const idx = q[qHead++];
+      const px = idx % AW;
+      const py = (idx - px) / AW;
+
+      if (px < minX) minX = px;
+      else if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      else if (py > maxY) maxY = py;
+
+      for (let d = 0; d < 4; d++) {
+        const nx = px + DX[d];
+        const ny = py + DY[d];
+        if (nx < 0 || nx >= AW || ny < 0 || ny >= AH) continue;
+        const ni = ny * AW + nx;
+        if (visited[ni]) continue;
+        if (rgbDist(refColor, getRgb(nx, ny)) <= tolerance) {
+          visited[ni] = 1;
+          q[qTail++] = ni;
         }
       }
-      const mean = sum / n;
-      variance.push(n > 0 ? sumSq / n - mean * mean : 9999);
     }
+
+    return { minX, minY, maxX, maxY, count: qTail };
   }
 
-  // Sort to get median variance threshold
-  const sorted  = [...variance].sort((a, b) => a - b);
-  const medVar  = sorted[Math.floor(sorted.length * 0.4)]; // 40th percentile
-  const threshold = medVar * 1.5; // blocks below this are "flat"
+  const scaleX = CANVAS_W / AW;
+  const scaleY = CANVAS_H / AH;
 
-  // Only consider centre 80% of image to avoid street / parking lot edges
-  const mgnX = Math.max(1, Math.floor(bW * 0.1));
-  const mgnY = Math.max(1, Math.floor(bH * 0.15));
+  // Try tighter → looser tolerances; accept first plausible result
+  for (const tol of [22, 38, 55]) {
+    const { minX, minY, maxX, maxY } = floodFill(tol);
+    const dw = maxX - minX;
+    const dh = maxY - minY;
 
-  // Score each block: flat + central = roof candidate
-  const cx = bW / 2, cy = bH / 2;
-  let minBX = bW, minBY = bH, maxBX = 0, maxBY = 0, found = false;
+    // Reject if region is trivially small
+    if (dw < 8 || dh < 5) continue;
 
-  for (let by = mgnY; by < bH - mgnY; by++) {
-    for (let bx = mgnX; bx < bW - mgnX; bx++) {
-      const v   = variance[by * bW + bx];
-      const dx  = (bx - cx) / (bW / 2);
-      const dy  = (by - cy) / (bH / 2);
-      const dist = Math.sqrt(dx * dx + dy * dy); // 0 = centre, 1 = corner
+    // Reject if region flooded almost the entire image (found ground/sky)
+    const ratio = (dw * dh) / (AW * AH);
+    if (ratio > 0.78) continue;
 
-      // Accept flat blocks within the central ~65% of the image
-      if (v < threshold && dist < 0.65) {
-        minBX = Math.min(minBX, bx);
-        minBY = Math.min(minBY, by);
-        maxBX = Math.max(maxBX, bx + 1);
-        maxBY = Math.max(maxBY, by + 1);
-        found = true;
-      }
-    }
+    // Reject if region centre has drifted far from image centre
+    // (means we found a background feature, not the building)
+    const rcx = (minX + maxX) / 2;
+    const rcy = (minY + maxY) / 2;
+    if (Math.abs(rcx - cx) > AW * 0.32 || Math.abs(rcy - cy) > AH * 0.32) continue;
+
+    // Reject extreme aspect ratios (thin strips = road / wall, not rooftop)
+    const aspect = dw / Math.max(dh, 1);
+    if (aspect > 7 || aspect < 0.14) continue;
+
+    // Scale bounding box to canvas coords with 1-px padding
+    const rx = Math.max(0,            (minX - 1) * scaleX);
+    const ry = Math.max(HEADER_H,     (minY - 1) * scaleY);
+    const rw = Math.min(CANVAS_W - rx,(dw   + 2) * scaleX);
+    const rh = Math.min(CANVAS_H - FOOTER_H - ry, (dh + 2) * scaleY);
+
+    // Final sanity: visible panel area
+    if (rw < 40 || rh < 25) continue;
+
+    return { x: Math.round(rx), y: Math.round(ry), w: Math.round(rw), h: Math.round(rh) };
   }
 
-  const scaleX = CANVAS_W / SMALL_W;
-  const scaleY = CANVAS_H / SMALL_H;
-
-  if (!found || maxBX - minBX < 3 || maxBY - minBY < 2) {
-    return fallbackBounds(lat, roofAreaSqM);
-  }
-
-  // Pad 1 block around detected region
-  const rx = Math.max(0, (minBX - 1) * BLOCK * scaleX);
-  const ry = Math.max(HEADER_H, (minBY - 1) * BLOCK * scaleY);
-  const rw = Math.min(CANVAS_W - rx, (maxBX - minBX + 2) * BLOCK * scaleX);
-  const rh = Math.min(CANVAS_H - FOOTER_H - ry, (maxBY - minBY + 2) * BLOCK * scaleY);
-
-  // Reject result if it covers <5% or >90% of the canvas
-  const ratio = (rw * rh) / (CANVAS_W * CANVAS_H);
-  if (ratio < 0.05 || ratio > 0.90) {
-    return fallbackBounds(lat, roofAreaSqM);
-  }
-
-  return { x: rx, y: ry, w: rw, h: rh };
+  // All tolerances exhausted — fall back to area-based estimate
+  return fallbackBounds(lat, roofAreaSqM);
 }
 
 function fallbackBounds(lat: number, roofAreaSqM: number | null): RoofBounds {
@@ -394,7 +441,7 @@ export async function buildVisualBuffer(opts: VisualOptions): Promise<Buffer> {
   const { lat, lng, panelCount, roofAreaSqM, annualSavingsUsd, systemCapacityKw, rawSolarData, polygon } = opts;
 
   const savingsText  = annualSavingsUsd
-    ? `$${Math.round(annualSavingsUsd).toLocaleString()}`
+    ? `₹${Math.round(annualSavingsUsd).toLocaleString("en-IN")}`
     : "significant";
   const capacityText = systemCapacityKw ? `${systemCapacityKw.toFixed(1)} kW` : "";
 

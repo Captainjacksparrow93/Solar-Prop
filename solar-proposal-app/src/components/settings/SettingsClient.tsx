@@ -35,9 +35,9 @@ export function SettingsClient({ user, company }: Props) {
   const [phone, setPhone] = useState(company?.phone ?? "");
   const [address, setAddress] = useState(company?.address ?? "");
   const [primaryColor, setPrimaryColor] = useState(company?.primaryColor ?? "#f97316");
-  const [electricityRate, setElectricityRate] = useState(company?.defaultElectricityRate ?? 0.12);
+  const [electricityRate, setElectricityRate] = useState(company?.defaultElectricityRate ?? 9.0);
   const [panelWattage, setPanelWattage] = useState(company?.defaultPanelWattage ?? 400);
-  const [panelCostPerWatt, setPanelCostPerWatt] = useState(company?.defaultPanelCostPerWatt ?? 2.5);
+  const [panelCostPerWatt, setPanelCostPerWatt] = useState(company?.defaultPanelCostPerWatt ?? 45.0);
   const [incentivePercent, setIncentivePercent] = useState(company?.defaultIncentivePercent ?? 30);
   // Outreach & enrichment
   const [attomApiKey, setAttomApiKey] = useState(company?.attomApiKey ?? "");
@@ -178,11 +178,11 @@ export function SettingsClient({ user, company }: Props) {
           </p>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm text-slate-400 mb-1.5">Electricity rate ($/kWh)</label>
-              <input type="number" min={0.01} max={2} step={0.01} value={electricityRate}
+              <label className="block text-sm text-slate-400 mb-1.5">Electricity rate (₹/kWh)</label>
+              <input type="number" min={1} max={50} step={0.5} value={electricityRate}
                 onChange={(e) => setElectricityRate(Number(e.target.value))}
                 className="w-full px-3 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:border-orange-500" />
-              <p className="text-xs text-slate-600 mt-1">US avg: $0.12 | India: ~₹8/kWh ≈ $0.096</p>
+              <p className="text-xs text-slate-600 mt-1">India commercial avg: ₹8–12/kWh</p>
             </div>
             <div>
               <label className="block text-sm text-slate-400 mb-1.5">
@@ -192,20 +192,21 @@ export function SettingsClient({ user, company }: Props) {
               <input type="number" min={100} max={700} step={10} value={panelWattage}
                 onChange={(e) => setPanelWattage(Number(e.target.value))}
                 className="w-full px-3 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:border-orange-500" />
+              <p className="text-xs text-slate-600 mt-1">Typical: 400–545 W monocrystalline</p>
             </div>
             <div>
-              <label className="block text-sm text-slate-400 mb-1.5">Install cost ($/watt)</label>
-              <input type="number" min={0.5} max={10} step={0.1} value={panelCostPerWatt}
+              <label className="block text-sm text-slate-400 mb-1.5">Install cost (₹/watt)</label>
+              <input type="number" min={20} max={200} step={1} value={panelCostPerWatt}
                 onChange={(e) => setPanelCostPerWatt(Number(e.target.value))}
                 className="w-full px-3 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:border-orange-500" />
-              <p className="text-xs text-slate-600 mt-1">Typically $2.50–$3.50/W in the US</p>
+              <p className="text-xs text-slate-600 mt-1">India 2024: ₹40–55/W all-in installed</p>
             </div>
             <div>
               <label className="block text-sm text-slate-400 mb-1.5">Incentive / subsidy (%)</label>
               <input type="number" min={0} max={100} step={1} value={incentivePercent}
                 onChange={(e) => setIncentivePercent(Number(e.target.value))}
                 className="w-full px-3 py-2.5 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:border-orange-500" />
-              <p className="text-xs text-slate-600 mt-1">US federal ITC: 30% | India: varies by state</p>
+              <p className="text-xs text-slate-600 mt-1">PM Surya Ghar (residential): 30–40% | Commercial: accelerated depreciation</p>
             </div>
           </div>
         </section>

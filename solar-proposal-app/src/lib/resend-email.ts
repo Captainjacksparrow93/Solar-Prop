@@ -43,7 +43,7 @@ export function buildOutreachEmail(data: EmailData): string {
 
   const greeting = ownerName ? `Hi ${ownerName.split(" ")[0]},` : "Hello,";
   const savingsFormatted = annualSavingsUsd
-    ? `$${Math.round(annualSavingsUsd).toLocaleString()}`
+    ? `₹${Math.round(annualSavingsUsd).toLocaleString("en-IN")}`
     : "significant savings";
   const capacityText = systemCapacityKw ? `${systemCapacityKw.toFixed(1)} kW ` : "";
 

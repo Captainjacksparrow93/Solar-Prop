@@ -33,10 +33,10 @@ model Company {
   primaryColor   String  @default("#f97316")
   secondaryColor String  @default("#1e293b")
 
-  defaultElectricityRate  Float @default(0.12)
+  defaultElectricityRate  Float @default(9.0)   // ₹/kWh — India commercial average
   defaultPanelWattage     Int   @default(400)
-  defaultPanelCostPerWatt Float @default(2.5)
-  defaultIncentivePercent Float @default(30)
+  defaultPanelCostPerWatt Float @default(45.0)  // ₹/W installed — India 2024 avg
+  defaultIncentivePercent Float @default(30)    // PM Surya Ghar / accelerated depreciation
 
   // Outreach & enrichment settings
   attomApiKey  String?

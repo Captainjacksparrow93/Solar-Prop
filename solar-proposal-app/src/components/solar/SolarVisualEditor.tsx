@@ -25,7 +25,8 @@ interface Panel {
 
 const PANEL_W = 36;
 const PANEL_H = 20;
-const MAP_ZOOM = 20;
+// ESRI World Imagery is reliably available at zoom 19 globally; zoom 20 is sparse
+const MAP_ZOOM = 19;
 
 function getSatelliteUrl(lat: number, lng: number, zoom: number) {
   return `/api/satellite?lat=${lat}&lng=${lng}&zoom=${zoom}`;

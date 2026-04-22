@@ -46,7 +46,9 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const { x: xf, y: yf } = latLngToTileFloat(lat, lng, Math.min(zoom, 20));
+    // ESRI World Imagery reliably available up to zoom 19
+    const effectiveZoom = Math.min(zoom, 19);
+    const { x: xf, y: yf } = latLngToTileFloat(lat, lng, effectiveZoom);
     const tileX = Math.floor(xf);
     const tileY = Math.floor(yf);
 
@@ -61,7 +63,7 @@ export async function GET(req: NextRequest) {
         Array.from({ length: GRID }, async (_, col) => {
           const tx = tileX + col - half;
           const ty = tileY + row - half;
-          const buf = await fetchTile(zoom, ty, tx);
+          const buf = await fetchTile(effectiveZoom, ty, tx);
           tileBuffers.push({ input: buf, left: col * TILE_SIZE, top: row * TILE_SIZE });
         })
       ).flat()
@@ -78,10 +80,10 @@ export async function GET(req: NextRequest) {
       .png()
       .toBuffer();
 
-    // Crop 640×360 centred on the exact pixel of the lat/lng
+    // Crop 640×400 centred on the exact pixel of the lat/lng
     const centerPxX = (xf - (tileX - half)) * TILE_SIZE;
     const centerPxY = (yf - (tileY - half)) * TILE_SIZE;
-    const cropW = 640, cropH = 360;
+    const cropW = 640, cropH = 400;
     const cropX = Math.max(0, Math.min(totalW - cropW, Math.round(centerPxX - cropW / 2)));
     const cropY = Math.max(0, Math.min(totalH - cropH, Math.round(centerPxY - cropH / 2)));
 
