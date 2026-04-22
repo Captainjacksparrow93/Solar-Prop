@@ -35,6 +35,8 @@ async function fetchTile(z: number, y: number, x: number): Promise<Buffer> {
   }).jpeg().toBuffer();
 }
 
+export const maxDuration = 60;
+
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const lat  = parseFloat(searchParams.get("lat")  ?? "0");

@@ -1,37 +1,36 @@
 /**
- * Visual builder — ESRI satellite tiles + image-based roof detection + proportional panels.
+ * Visual builder — ESRI satellite tiles + per-building roof detection + accurate panel overlay.
  *
- * Roof detection approach (no ML, no external API):
- *   1. Downsample satellite image to 128×80 px
- *   2. Compute per-block local variance (8×8 px blocks)
- *   3. Flat/uniform blocks (low variance) = potential roof surface
- *   4. Find the largest connected flat region in the centre of the image
- *   5. Place panels proportionally inside that region
+ * Per-building customisation pipeline:
+ *   1. Fetch 3×3 grid of ESRI satellite tiles centred on building coords
+ *   2. BFS flood-fill from image centre to find the actual roof colour boundary
+ *   3. Convert flood-fill pixel count → real sq-m area (unique per building)
+ *   4. Calculate panel count from real area: 2m×1m panels, 72% usable fraction
+ *   5. Render panels proportionally inside the detected roof boundary
  *
- * This correctly handles any roof colour (white, grey, dark, tan, etc.)
- * because it detects UNIFORMITY, not brightness.
+ * Result: every building gets a different image — different roof size, shape,
+ * panel count, and savings overlay.
  */
 import sharp from "sharp";
 
-// ─── Canvas / panel constants ─────────────────────────────────────────────────
-const TILE_SIZE   = 256;
-const CANVAS_W    = 640;
-const CANVAS_H    = 400;
-const ZOOM        = 19;   // satellite tiles zoom — 1px ≈ 0.30 m at equator
+// ─── Canvas / display constants ───────────────────────────────────────────────
+const TILE_SIZE = 256;
+const CANVAS_W  = 640;
+const CANVAS_H  = 400;
+const ZOOM      = 19;   // ESRI tiles zoom — ~0.30 m/px at equator
 
-// Real-world solar panel dimensions (metres) — industry standard 60-cell panel
-const PANEL_W_M   = 2.0;  // 2 m wide
-const PANEL_H_M   = 1.0;  // 1 m tall
-const PANEL_GAP_M = 0.20; // 20 cm gap between panels
-// Visibility scale: render panels at 1.4× real size so they're legible on screen
-// (1× real at zoom 19 ≈ 6-7 px wide — barely visible; 1.4× ≈ 9-10 px — clear)
+// Panel real-world dimensions (metres, standard 60-cell monocrystalline)
+const PANEL_W_M   = 2.0;
+const PANEL_H_M   = 1.0;
+const PANEL_GAP_M = 0.20;
+// Render at 1.4× real size for screen legibility
 const VIS_SCALE   = 1.4;
 
-// Header and footer overlay heights (must not be covered by panels)
-const HEADER_H    = 55;
-const FOOTER_H    = 32;
+// Header / footer overlay heights
+const HEADER_H = 55;
+const FOOTER_H = 32;
 
-// ─── Tile math ────────────────────────────────────────────────────────────────
+// ─── Geo maths ────────────────────────────────────────────────────────────────
 
 function mpp(lat: number, zoom: number): number {
   return (156543.03 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
@@ -44,6 +43,8 @@ function latLngToTileFloat(lat: number, lng: number, zoom: number) {
   const y   = ((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2) * n;
   return { x, y };
 }
+
+// ─── ESRI tile fetcher ────────────────────────────────────────────────────────
 
 async function fetchEsriTile(z: number, ty: number, tx: number): Promise<Buffer | null> {
   const urls = [
@@ -76,8 +77,8 @@ async function buildSatelliteBuffer(lat: number, lng: number): Promise<Buffer> {
     ).flat()
   );
 
-  const totalW = TILE_SIZE * GRID; // 768
-  const totalH = TILE_SIZE * GRID; // 768
+  const totalW = TILE_SIZE * GRID;
+  const totalH = TILE_SIZE * GRID;
 
   const stitched = await sharp({
     create: { width: totalW, height: totalH, channels: 3, background: { r: 20, g: 25, b: 30 } },
@@ -109,26 +110,25 @@ function ptInPoly(px: number, py: number, poly: Array<{ x: number; y: number }>)
   return inside;
 }
 
-// ─── Roof detection via flood-fill from image centre ─────────────────────────
+// ─── Roof detection — BFS flood-fill from image centre ───────────────────────
 //
-// Strategy: the satellite image is centred exactly on the building's coordinates.
-// Starting from the centre pixel, we BFS-expand to adjacent pixels that have a
-// similar colour (within a Euclidean RGB distance tolerance).  The bounding box
-// of the filled region IS the building footprint.
+// Each satellite image is centred on the building's lat/lng. We BFS from the
+// centre pixel expanding to neighbours with similar colour. The result:
+//   • bounds  — the pixel bounding box of the roof on the canvas
+//   • estimatedAreaSqM — the roof area in real sq-m from pixel count
 //
-// We try three tolerances in sequence and accept the first that gives a
-// plausible result (not too small, not flooding the entire ground).
-//
-// Why this beats variance blocks:
-//   • Variance blocks find ANY flat area (roads, car parks) — this starts from
-//     the building centre and expands along its actual colour.
-//   • Produces a different bounding box per building, not a generic rectangle.
-//   • Works on dark roofs, light roofs, red tiles, metal — any surface colour.
+// estimatedAreaSqM is the key: it is UNIQUE per building because it comes
+// from the actual pixels, not a fixed 800 sqm default.
 
 interface RoofBounds { x: number; y: number; w: number; h: number }
+interface DetectResult { bounds: RoofBounds; estimatedAreaSqM: number | null }
 
-async function detectRoofBounds(satBuffer: Buffer, lat: number, roofAreaSqM: number | null): Promise<RoofBounds> {
-  // Analysis resolution: 320×200 — fine enough to distinguish 5 m features at zoom 19
+async function detectRoof(
+  satBuffer: Buffer,
+  lat: number,
+  hintAreaSqM: number | null,
+): Promise<DetectResult> {
+  // Analysis at 320×200 (2× downscale from 640×400 canvas)
   const AW = 320, AH = 200;
 
   const { data: pixels } = await sharp(satBuffer)
@@ -137,33 +137,30 @@ async function detectRoofBounds(satBuffer: Buffer, lat: number, roofAreaSqM: num
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  // Helper: RGB triplet at pixel (x, y)
   function getRgb(x: number, y: number): [number, number, number] {
     const i = (y * AW + x) * 3;
     return [pixels[i], pixels[i + 1], pixels[i + 2]];
   }
 
-  // Euclidean distance in RGB space
   function rgbDist(a: [number, number, number], b: [number, number, number]): number {
-    return Math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2);
+    return Math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2);
   }
 
-  // Sample a 3×3 patch around the image centre for a stable reference colour
+  // Sample 5×5 patch around centre for robust reference colour
   const cx = Math.floor(AW / 2);
   const cy = Math.floor(AH / 2);
-  let rSum = 0, gSum = 0, bSum = 0, nPx = 0;
-  for (let dy = -1; dy <= 1; dy++) {
-    for (let dx = -1; dx <= 1; dx++) {
-      const [r, g, b] = getRgb(cx + dx, cy + dy);
-      rSum += r; gSum += g; bSum += b; nPx++;
+  let rS = 0, gS = 0, bS = 0, n = 0;
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const [r, g, b] = getRgb(Math.max(0, Math.min(AW - 1, cx + dx)),
+                                Math.max(0, Math.min(AH - 1, cy + dy)));
+      rS += r; gS += g; bS += b; n++;
     }
   }
-  const refColor: [number, number, number] = [rSum / nPx, gSum / nPx, bSum / nPx];
+  const ref: [number, number, number] = [rS / n, gS / n, bS / n];
 
-  // BFS flood fill — returns bounding box + pixel count
-  function floodFill(tolerance: number): { minX: number; minY: number; maxX: number; maxY: number; count: number } {
+  function floodFill(tol: number) {
     const visited = new Uint8Array(AW * AH);
-    // Use a flat index array as the queue for speed (avoid object allocations)
     const q = new Int32Array(AW * AH);
     let qHead = 0, qTail = 0;
 
@@ -172,19 +169,16 @@ async function detectRoofBounds(satBuffer: Buffer, lat: number, roofAreaSqM: num
     q[qTail++] = startIdx;
 
     let minX = cx, maxX = cx, minY = cy, maxY = cy;
-
     const DX = [-1, 1, 0, 0];
     const DY = [0, 0, -1, 1];
 
     while (qHead < qTail) {
       const idx = q[qHead++];
-      const px = idx % AW;
-      const py = (idx - px) / AW;
+      const px  = idx % AW;
+      const py  = (idx - px) / AW;
 
-      if (px < minX) minX = px;
-      else if (px > maxX) maxX = px;
-      if (py < minY) minY = py;
-      else if (py > maxY) maxY = py;
+      if (px < minX) minX = px; else if (px > maxX) maxX = px;
+      if (py < minY) minY = py; else if (py > maxY) maxY = py;
 
       for (let d = 0; d < 4; d++) {
         const nx = px + DX[d];
@@ -192,61 +186,59 @@ async function detectRoofBounds(satBuffer: Buffer, lat: number, roofAreaSqM: num
         if (nx < 0 || nx >= AW || ny < 0 || ny >= AH) continue;
         const ni = ny * AW + nx;
         if (visited[ni]) continue;
-        if (rgbDist(refColor, getRgb(nx, ny)) <= tolerance) {
+        if (rgbDist(ref, getRgb(nx, ny)) <= tol) {
           visited[ni] = 1;
           q[qTail++] = ni;
         }
       }
     }
-
     return { minX, minY, maxX, maxY, count: qTail };
   }
 
   const scaleX = CANVAS_W / AW;
   const scaleY = CANVAS_H / AH;
+  // Each analysis pixel covers this many real-world metres (2× canvas scale)
+  const analysisMpp = mpp(lat, ZOOM) * (CANVAS_W / AW);
 
-  // Try tighter → looser tolerances; accept first plausible result
   for (const tol of [22, 38, 55]) {
-    const { minX, minY, maxX, maxY } = floodFill(tol);
+    const { minX, minY, maxX, maxY, count } = floodFill(tol);
     const dw = maxX - minX;
     const dh = maxY - minY;
 
-    // Reject if region is trivially small
     if (dw < 8 || dh < 5) continue;
 
-    // Reject if region flooded almost the entire image (found ground/sky)
     const ratio = (dw * dh) / (AW * AH);
     if (ratio > 0.78) continue;
 
-    // Reject if region centre has drifted far from image centre
-    // (means we found a background feature, not the building)
     const rcx = (minX + maxX) / 2;
     const rcy = (minY + maxY) / 2;
-    if (Math.abs(rcx - cx) > AW * 0.32 || Math.abs(rcy - cy) > AH * 0.32) continue;
+    if (Math.abs(rcx - cx) > AW * 0.35 || Math.abs(rcy - cy) > AH * 0.35) continue;
 
-    // Reject extreme aspect ratios (thin strips = road / wall, not rooftop)
     const aspect = dw / Math.max(dh, 1);
-    if (aspect > 7 || aspect < 0.14) continue;
+    if (aspect > 8 || aspect < 0.12) continue;
 
-    // Scale bounding box to canvas coords with 1-px padding
     const rx = Math.max(0,            (minX - 1) * scaleX);
     const ry = Math.max(HEADER_H,     (minY - 1) * scaleY);
-    const rw = Math.min(CANVAS_W - rx,(dw   + 2) * scaleX);
+    const rw = Math.min(CANVAS_W - rx,(dw + 2)   * scaleX);
     const rh = Math.min(CANVAS_H - FOOTER_H - ry, (dh + 2) * scaleY);
 
-    // Final sanity: visible panel area
-    if (rw < 40 || rh < 25) continue;
+    if (rw < 30 || rh < 20) continue;
 
-    return { x: Math.round(rx), y: Math.round(ry), w: Math.round(rw), h: Math.round(rh) };
+    // Pixel count → real sq-m area (unique per building)
+    const estimatedAreaSqM = Math.round(count * analysisMpp * analysisMpp);
+
+    return {
+      bounds: { x: Math.round(rx), y: Math.round(ry), w: Math.round(rw), h: Math.round(rh) },
+      estimatedAreaSqM,
+    };
   }
 
-  // All tolerances exhausted — fall back to area-based estimate
-  return fallbackBounds(lat, roofAreaSqM);
+  // Flood-fill failed — use hint area or generic centred rectangle
+  return { bounds: fallbackBounds(lat, hintAreaSqM), estimatedAreaSqM: null };
 }
 
 function fallbackBounds(lat: number, roofAreaSqM: number | null): RoofBounds {
-  // Estimate from known building area using pixel scale (match satellite zoom)
-  const scale = mpp(lat, ZOOM);
+  const scale    = mpp(lat, ZOOM);
   const usable_h = CANVAS_H - HEADER_H - FOOTER_H;
 
   let rw: number, rh: number;
@@ -259,9 +251,8 @@ function fallbackBounds(lat: number, roofAreaSqM: number | null): RoofBounds {
     rh = usable_h * 0.60;
   }
 
-  // Clamp
-  rw = Math.max(CANVAS_W * 0.25, Math.min(CANVAS_W * 0.88, rw));
-  rh = Math.max(usable_h * 0.25, Math.min(usable_h * 0.88, rh));
+  rw = Math.max(CANVAS_W * 0.20, Math.min(CANVAS_W * 0.88, rw));
+  rh = Math.max(usable_h * 0.20, Math.min(usable_h * 0.88, rh));
 
   return {
     x: Math.round((CANVAS_W - rw) / 2),
@@ -271,18 +262,23 @@ function fallbackBounds(lat: number, roofAreaSqM: number | null): RoofBounds {
   };
 }
 
-// ─── Project Solar API roof segment (if available) ───────────────────────────
+// ─── Panel count from area ────────────────────────────────────────────────────
+
+/** 2m×1m panel, 72% usable roof fraction, 15% spacing → 2.3 sqm effective per panel */
+function panelsFromArea(areaSqM: number): number {
+  return Math.max(4, Math.floor((areaSqM * 0.72) / 2.3));
+}
+
+// ─── Solar API roof segment projection ───────────────────────────────────────
 
 function projectSolarSegments(
   lat: number,
   lng: number,
   rawSolarData: Record<string, unknown> | null | undefined,
 ): RoofBounds | null {
-  const segments: any[] =
-    (rawSolarData as any)?.solarPotential?.roofSegmentStats ?? [];
+  const segments: any[] = (rawSolarData as any)?.solarPotential?.roofSegmentStats ?? [];
   if (!segments.length) return null;
 
-  // Use the segment with the most area (most usable)
   const best = segments
     .filter((s: any) => (s.pitchDegrees ?? 90) < 40)
     .sort((a: any, b: any) => (b.stats?.areaMeters2 ?? 0) - (a.stats?.areaMeters2 ?? 0))[0];
@@ -311,21 +307,17 @@ function projectSolarSegments(
   return { x: Math.max(0, x), y: Math.max(HEADER_H, y), w, h };
 }
 
-// ─── Panel SVG builder ───────────────────────────────────────────────────────
+// ─── Panel SVG ────────────────────────────────────────────────────────────────
 
-function panelSvgInner(
-  x: number, y: number, pW: number, pH: number,
-): string {
-  // Deep navy panel with blue border (realistic monocrystalline silicon look)
-  // Cell grid lines only when panel is large enough to render them clearly
+function panelSvgInner(x: number, y: number, pW: number, pH: number): string {
   const showGrid = pW >= 10 && pH >= 6;
-  const grid = showGrid ? `
-  <line x1="${x+pW*.33}" y1="${y}" x2="${x+pW*.33}" y2="${y+pH}" stroke="rgba(96,165,250,.35)" stroke-width="0.4"/>
-  <line x1="${x+pW*.67}" y1="${y}" x2="${x+pW*.67}" y2="${y+pH}" stroke="rgba(96,165,250,.35)" stroke-width="0.4"/>
-  <line x1="${x}" y1="${y+pH*.5}" x2="${x+pW}" y2="${y+pH*.5}" stroke="rgba(96,165,250,.35)" stroke-width="0.4"/>` : "";
-  // Subtle highlight on top-left corner to simulate glass reflection
+  const grid = showGrid
+    ? `<line x1="${x + pW * 0.33}" y1="${y}" x2="${x + pW * 0.33}" y2="${y + pH}" stroke="rgba(96,165,250,.35)" stroke-width="0.4"/>
+       <line x1="${x + pW * 0.67}" y1="${y}" x2="${x + pW * 0.67}" y2="${y + pH}" stroke="rgba(96,165,250,.35)" stroke-width="0.4"/>
+       <line x1="${x}" y1="${y + pH * 0.5}" x2="${x + pW}" y2="${y + pH * 0.5}" stroke="rgba(96,165,250,.35)" stroke-width="0.4"/>`
+    : "";
   const highlight = pW >= 8
-    ? `<rect x="${x+1}" y="${y+1}" width="${Math.round(pW*0.4)}" height="1" fill="rgba(255,255,255,0.18)"/>`
+    ? `<rect x="${x + 1}" y="${y + 1}" width="${Math.round(pW * 0.4)}" height="1" fill="rgba(255,255,255,0.18)"/>`
     : "";
   return `<rect x="${x}" y="${y}" width="${pW}" height="${pH}" rx="0.5"
     fill="rgba(15,40,105,0.95)" stroke="rgba(59,130,246,0.85)" stroke-width="0.6"/>
@@ -340,7 +332,6 @@ function buildPanelSvg(
   capacityText: string,
   polygon?: Array<{ x: number; y: number }> | null,
 ): Buffer {
-  // Use same zoom as satellite tiles so pixel size matches real-world scale
   const scale = mpp(lat, ZOOM);
   const pW    = Math.max(6, Math.round((PANEL_W_M   * VIS_SCALE) / scale));
   const pH    = Math.max(4, Math.round((PANEL_H_M   * VIS_SCALE) / scale));
@@ -352,18 +343,15 @@ function buildPanelSvg(
   let count = 0;
 
   if (polygon && polygon.length >= 3) {
-    // ── Polygon mode: fill every grid cell whose centre is inside the polygon ──
-    // Draw the user's polygon outline
     const pts = polygon.map(p => `${p.x},${p.y}`).join(" ");
     panelsSvg += `<polygon points="${pts}" fill="rgba(59,130,246,0.08)"
       stroke="rgba(96,165,250,0.6)" stroke-width="1.5" stroke-dasharray="5 3"/>`;
 
-    // Scan the full canvas in panel-sized steps
     for (let y = gap; y + pH < CANVAS_H - FOOTER_H; y += cellH) {
       for (let x = gap; x + pW < CANVAS_W; x += cellW) {
         if (count >= panelCount) break;
-        const cx = x + pW / 2, cy = y + pH / 2;
-        if (ptInPoly(cx, cy, polygon) && cy >= HEADER_H) {
+        const pcx = x + pW / 2, pcy = y + pH / 2;
+        if (ptInPoly(pcx, pcy, polygon) && pcy >= HEADER_H) {
           panelsSvg += panelSvgInner(x, y, pW, pH);
           count++;
         }
@@ -371,7 +359,6 @@ function buildPanelSvg(
       if (count >= panelCount) break;
     }
   } else {
-    // ── Bounding-box mode: grid within detected/estimated roof bounds ──
     panelsSvg += `<rect x="${bounds.x}" y="${bounds.y}" width="${bounds.w}" height="${bounds.h}"
       rx="3" fill="rgba(59,130,246,0.07)" stroke="rgba(96,165,250,0.55)"
       stroke-width="1.5" stroke-dasharray="6 3"/>`;
@@ -399,8 +386,8 @@ function buildPanelSvg(
   }
 
   const label = polygon
-    ? "Panels placed on user-selected rooftop"
-    : "Roof area auto-detected from satellite";
+    ? "Panels on user-drawn rooftop"
+    : "Rooftop auto-detected from satellite";
 
   return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${CANVAS_W}" height="${CANVAS_H}">
   <rect x="0" y="0" width="${CANVAS_W}" height="${HEADER_H}" fill="rgba(0,0,0,0.70)"/>
@@ -408,58 +395,87 @@ function buildPanelSvg(
     ⚡ ${count} Solar Panels${capacityText ? "  ·  " + capacityText + " system" : ""}
   </text>
   <text x="14" y="42" font-family="Arial,sans-serif" font-size="11" fill="#94a3b8">
-    Saves ${savingsText}/year · ${label}
+    Saves ${savingsText}/yr · ${label}
   </text>
   ${panelsSvg}
-  <rect x="0" y="${CANVAS_H-FOOTER_H}" width="${CANVAS_W}" height="${FOOTER_H}" fill="rgba(0,0,0,0.72)"/>
-  <text x="14" y="${CANVAS_H-10}" font-family="Arial,sans-serif" font-size="10" font-weight="bold" fill="#fb923c">
+  <rect x="0" y="${CANVAS_H - FOOTER_H}" width="${CANVAS_W}" height="${FOOTER_H}" fill="rgba(0,0,0,0.72)"/>
+  <text x="14" y="${CANVAS_H - 10}" font-family="Arial,sans-serif" font-size="10" font-weight="bold" fill="#fb923c">
     SolarPropose · Your building. Solar-ready.
   </text>
-  <text x="${CANVAS_W-14}" y="${CANVAS_H-10}" font-family="Arial,sans-serif"
+  <text x="${CANVAS_W - 14}" y="${CANVAS_H - 10}" font-family="Arial,sans-serif"
         font-size="9" fill="#374151" text-anchor="end">© ESRI World Imagery</text>
 </svg>`);
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/** Normalised polygon points (x/y each 0–1 relative to canvas size) */
 export interface NormPoint { x: number; y: number }
 
 export interface VisualOptions {
   lat: number;
   lng: number;
-  panelCount: number;
+  panelCount: number;        // stored value from DB — may be overridden by image analysis
   roofAreaSqM?: number | null;
   annualSavingsUsd?: number | null;
   systemCapacityKw?: number | null;
   rawSolarData?: unknown;
-  /** User-drawn polygon (normalised 0-1 coords). If provided, skips auto-detection. */
   polygon?: NormPoint[] | null;
 }
 
 export async function buildVisualBuffer(opts: VisualOptions): Promise<Buffer> {
-  const { lat, lng, panelCount, roofAreaSqM, annualSavingsUsd, systemCapacityKw, rawSolarData, polygon } = opts;
+  const { lat, lng, roofAreaSqM, annualSavingsUsd, systemCapacityKw, rawSolarData, polygon } = opts;
 
   const savingsText  = annualSavingsUsd
     ? `₹${Math.round(annualSavingsUsd).toLocaleString("en-IN")}`
     : "significant";
-  const capacityText = systemCapacityKw ? `${systemCapacityKw.toFixed(1)} kW` : "";
 
   // 1. Fetch satellite image
   const satBuffer = await buildSatelliteBuffer(lat, lng);
 
-  // 2. If user drew a polygon — use it directly (most accurate)
+  // 2. User-drawn polygon — most accurate, skip all detection
   if (polygon && polygon.length >= 3) {
-    // Denormalise: 0-1 → canvas pixel coords
     const canvasPoly = polygon.map(p => ({ x: p.x * CANVAS_W, y: p.y * CANVAS_H }));
-    const panelSvg   = buildPanelSvg(lat, { x:0,y:0,w:0,h:0 }, panelCount, savingsText, capacityText, canvasPoly);
+    // Count panels that fit in polygon at real scale
+    const scale = mpp(lat, ZOOM);
+    const pW  = Math.max(6, Math.round((PANEL_W_M * VIS_SCALE) / scale));
+    const pH  = Math.max(4, Math.round((PANEL_H_M * VIS_SCALE) / scale));
+    const gap = Math.max(1, Math.round((PANEL_GAP_M * VIS_SCALE) / scale));
+    let polyPanels = 0;
+    for (let y = gap; y + pH < CANVAS_H - FOOTER_H; y += pH + gap) {
+      for (let x = gap; x + pW < CANVAS_W; x += pW + gap) {
+        if (ptInPoly(x + pW / 2, y + pH / 2, canvasPoly)) polyPanels++;
+      }
+    }
+    const capacityText = polyPanels > 0
+      ? `${((polyPanels * 400) / 1000).toFixed(1)} kW`
+      : (systemCapacityKw ? `${systemCapacityKw.toFixed(1)} kW` : "");
+    const panelSvg = buildPanelSvg(lat, { x: 0, y: 0, w: 0, h: 0 }, polyPanels, savingsText, capacityText, canvasPoly);
     return sharp(satBuffer).composite([{ input: panelSvg, top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
   }
 
-  // 3. No polygon — auto-detect roof from image / Solar API / area estimate
+  // 3. Try Solar API segment bounds (most precise when available)
   const apiSegmentBounds = projectSolarSegments(lat, lng, rawSolarData as Record<string, unknown> | null);
-  const bounds = apiSegmentBounds ?? await detectRoofBounds(satBuffer, lat, roofAreaSqM ?? null);
 
-  const panelSvg = buildPanelSvg(lat, bounds, panelCount, savingsText, capacityText, null);
+  // 4. Run per-building roof detection from satellite pixels
+  const { bounds: detectedBounds, estimatedAreaSqM } = await detectRoof(satBuffer, lat, roofAreaSqM ?? null);
+
+  // Pick best bounds
+  const bounds = apiSegmentBounds ?? detectedBounds;
+
+  // 5. Panel count: prefer image-derived area → stored DB value
+  //    Image-derived is unique per building; DB value may be the generic 800sqm default
+  const effectiveArea = estimatedAreaSqM ?? roofAreaSqM;
+  const effectivePanelCount = effectiveArea != null
+    ? panelsFromArea(effectiveArea)
+    : opts.panelCount;
+
+  const capacityText = systemCapacityKw
+    ? `${((effectivePanelCount * 400) / 1000).toFixed(1)} kW`
+    : "";
+
+  const panelSvg = buildPanelSvg(lat, bounds, effectivePanelCount, savingsText, capacityText, null);
   return sharp(satBuffer).composite([{ input: panelSvg, top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
 }
+
+/** Exported for score route — same formula as panelsFromArea in google-solar.ts */
+export { panelsFromArea };

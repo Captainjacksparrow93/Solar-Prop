@@ -68,8 +68,6 @@ export function SolarVisualEditor({ leadId, lat, lng, panelCount, initialLayout,
   const [dragging, setDragging] = useState<{ panelId: string; offsetX: number; offsetY: number } | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const apiKey = ""; // no longer needed — satellite images served via /api/satellite
-
   // Canvas size
   const CANVAS_W = 640;
   const CANVAS_H = 400;
@@ -83,12 +81,14 @@ export function SolarVisualEditor({ leadId, lat, lng, panelCount, initialLayout,
     }
   }, [panelCount, initialLayout]);
 
-  // Load image (uploaded or satellite)
+  // Load satellite/uploaded background image
   useEffect(() => {
     setImageLoading(true);
     setImageError(false);
     const img = new Image();
-    img.crossOrigin = "anonymous";
+    // DO NOT set crossOrigin — /api/satellite is same-origin (no CORS needed).
+    // Setting crossOrigin on a same-origin request with no CORS headers causes
+    // the browser to refuse to draw the image onto the canvas.
     img.onload = () => {
       setBgImage(img);
       setImageLoading(false);
@@ -97,14 +97,8 @@ export function SolarVisualEditor({ leadId, lat, lng, panelCount, initialLayout,
       setImageError(true);
       setImageLoading(false);
     };
-
-    // Use uploaded image if available, otherwise fall back to satellite image
-    if (uploadedImageUrl) {
-      img.src = uploadedImageUrl;
-    } else {
-      img.src = getSatelliteUrl(lat, lng, MAP_ZOOM);
-    }
-  }, [uploadedImageUrl, lat, lng, apiKey]);
+    img.src = uploadedImageUrl ?? getSatelliteUrl(lat, lng, MAP_ZOOM);
+  }, [uploadedImageUrl, lat, lng]);
 
   // Draw canvas
   const draw = useCallback(() => {

@@ -37,10 +37,11 @@ export async function GET(
       polygon,
     });
 
-    // If a custom polygon was used, don't cache — every polygon request is unique
+    // Cache for 1 hour (not 24h) so re-analyzed buildings get fresh visuals quickly.
+    // Polygon requests are never cached — every polygon is unique.
     const cacheHeader = polygon
       ? "no-store"
-      : "public, max-age=86400, s-maxage=86400, stale-while-revalidate=604800";
+      : "public, max-age=3600, s-maxage=3600, stale-while-revalidate=86400";
 
     return new NextResponse(buffer.buffer as ArrayBuffer, {
       headers: {
