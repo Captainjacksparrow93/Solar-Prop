@@ -36,38 +36,57 @@ export async function geocodeAddress(address: string): Promise<LatLng | null> {
   return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
 }
 
-// ─── Overpass mirrors (try in order, keep first that returns data) ─────────────
+// ─── Overpass mirrors — queried in parallel, best result wins ─────────────────
+//
+// Sequential probing meant a slow/overloaded mirror consumed 30 s before the
+// next was tried. On Vercel functions this frequently exhausted the 60 s budget.
+// Parallel probing returns as soon as ANY mirror delivers useful data.
 
 const OVERPASS_MIRRORS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
   "https://overpass.openstreetmap.ru/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter", // extra mirror
 ];
 
-async function queryOverpass(query: string): Promise<any[]> {
-  for (const mirror of OVERPASS_MIRRORS) {
-    try {
-      const res = await fetch(mirror, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: `data=${encodeURIComponent(query)}`,
-        signal: AbortSignal.timeout(30000),
-      });
-      if (!res.ok) continue;
-
-      const text = await res.text();
-
-      // Detect HTML error responses (Overpass servers return HTML on runtime errors)
-      if (text.trim().startsWith("<")) continue;
-
-      try {
-        const data = JSON.parse(text);
-        const elements: any[] = data.elements ?? [];
-        if (elements.length > 0) return elements;
-      } catch { continue; }
-    } catch { /* timeout or network — try next */ }
+async function querySingleMirror(mirror: string, query: string, timeoutMs: number): Promise<any[]> {
+  try {
+    const res = await fetch(mirror, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return [];
+    const text = await res.text();
+    if (text.trim().startsWith("<")) return []; // HTML error page
+    const data = JSON.parse(text);
+    return data.elements ?? [];
+  } catch {
+    return [];
   }
-  return [];
+}
+
+async function queryOverpass(query: string): Promise<any[]> {
+  // Race all mirrors simultaneously; return the first response with ≥1 element.
+  // If multiple mirrors answer, the fastest one wins.
+  return new Promise((resolve) => {
+    let settled = false;
+    let pending = OVERPASS_MIRRORS.length;
+
+    OVERPASS_MIRRORS.forEach((mirror) => {
+      querySingleMirror(mirror, query, 45000).then((elements) => {
+        pending--;
+        if (!settled && elements.length > 0) {
+          settled = true;
+          resolve(elements);
+        } else if (pending === 0 && !settled) {
+          // All mirrors returned empty — resolve with empty array
+          resolve([]);
+        }
+      });
+    });
+  });
 }
 
 // ─── Build Overpass query ─────────────────────────────────────────────────────
@@ -130,7 +149,9 @@ function buildQuery(center: LatLng, radiusMeters: number, maxResults: number, qu
   way["office"]${around};
   node["office"]${around};`;
 
-  return `[out:json][timeout:30];\n(\n${targeted}\n${broad}\n);\nout center qt ${maxResults};`;
+  // Use out center body (not just qt) so way elements include full tag set.
+  // Double maxResults in query to give dedup room; parseElements slices to actual limit.
+  return `[out:json][timeout:45];\n(\n${targeted}\n${broad}\n);\nout center body qt ${maxResults * 2};`;
 }
 
 // ─── Parse Overpass elements → PlaceResult ────────────────────────────────────

@@ -9,7 +9,7 @@ import { db } from "@/lib/db";
 import { getDefaultUserId } from "@/lib/default-user";
 import { scanByRadius, scanByPolygon, scanFromCsv } from "@/lib/area-scanner";
 
-export const maxDuration = 60;
+export const maxDuration = 300; // Overpass can be slow; give 5 min on Vercel Pro / Hobby gets 60 s
 
 export async function POST(req: NextRequest) {
   const userId = await getDefaultUserId();
@@ -44,28 +44,49 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ jobId: job.id, totalFound: 0 });
     }
 
-    // Upsert leads
+    // Upsert leads — reset ALL scoring fields so re-scanned buildings get
+    // re-analysed. Without this, old roofScore values exclude them from the
+    // scoring phase (score route queries WHERE roofScore IS NULL).
     await Promise.all(places.map(p =>
       db.lead.upsert({
         where: { placeId: p.placeId },
-        update: { scanJobId: job.id },
+        update: {
+          scanJobId:      job.id,
+          status:         "NEW",
+          roofScore:      null,
+          urgencyScore:   null,
+          solarScore:     null,
+          roofScoreLabel: null,
+          animationUrl:   null,
+          // Refresh location & contact info in case OSM data changed
+          businessName:  p.businessName,
+          address:       p.address,
+          city:          p.city,
+          state:         p.state,
+          country:       p.country,
+          lat:           p.lat,
+          lng:           p.lng,
+          phone:         p.phone ?? undefined,
+          website:       p.website ?? undefined,
+          businessType:  p.businessType ?? undefined,
+        },
         create: {
           userId,
-          scanJobId: job.id,
+          scanJobId:    job.id,
           businessName: p.businessName,
-          address: p.address,
-          city: p.city,
-          state: p.state,
-          country: p.country,
-          placeId: p.placeId,
-          phone: p.phone,
-          website: p.website,
+          address:      p.address,
+          city:         p.city,
+          state:        p.state,
+          country:      p.country,
+          placeId:      p.placeId,
+          phone:        p.phone,
+          website:      p.website,
           businessType: p.businessType,
-          rating: p.rating,
+          rating:       p.rating,
           totalRatings: p.totalRatings,
-          lat: p.lat,
-          lng: p.lng,
-          status: "NEW",
+          lat:          p.lat,
+          lng:          p.lng,
+          status:       "NEW",
         },
       })
     ));

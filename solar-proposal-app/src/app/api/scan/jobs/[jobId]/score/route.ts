@@ -39,9 +39,10 @@ export async function POST(
   }
 
   const company = await db.company.findUnique({ where: { userId } });
-  const electricityRate  = company?.defaultElectricityRate  ?? 0.12;
+  // Fallbacks are INR-denominated Indian market defaults
+  const electricityRate  = company?.defaultElectricityRate  ?? 9.0;
   const panelWattage     = company?.defaultPanelWattage     ?? 400;
-  const panelCostPerWatt = company?.defaultPanelCostPerWatt ?? 2.5;
+  const panelCostPerWatt = company?.defaultPanelCostPerWatt ?? 45.0;
   const incentivePercent = company?.defaultIncentivePercent ?? 30;
 
   const scoringInputs: Array<{
