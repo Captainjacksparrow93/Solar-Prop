@@ -1,0 +1,274 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String?
+  role      Role     @default(USER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company   Company?
+  leads     Lead[]
+  proposals Proposal[]
+  scanJobs  ScanJob[]
+  campaigns OutreachCampaign[]
+}
+
+model Company {
+  id             String  @id @default(cuid())
+  name           String
+  logo           String?
+  website        String?
+  phone          String?
+  address        String?
+  primaryColor   String  @default("#f97316")
+  secondaryColor String  @default("#1e293b")
+
+  defaultElectricityRate  Float @default(0.12)
+  defaultPanelWattage     Int   @default(400)
+  defaultPanelCostPerWatt Float @default(2.5)
+  defaultIncentivePercent Float @default(30)
+
+  // Outreach & enrichment settings
+  attomApiKey  String?
+  resendApiKey String?
+  fromEmail    String?
+  fromName     String?
+  calendlyLink String?
+
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Lead {
+  id           String     @id @default(cuid())
+  businessName String
+  address      String
+  city         String?
+  state        String?
+  country      String?
+  placeId      String?    @unique
+  phone        String?
+  website      String?
+  businessType String?
+  rating       Float?
+  totalRatings Int?
+  lat          Float?
+  lng          Float?
+  status       LeadStatus @default(NEW)
+  notes        String?
+
+  // Owner enrichment (ATTOM)
+  ownerName      String?
+  ownerEmail     String?
+  ownerPhone     String?
+  ownerAddress   String?
+  ownerLookupAt  DateTime?
+
+  // Roof scoring
+  roofScore      Float?
+  urgencyScore   Float?
+  solarScore     Float?
+  roofScoreLabel String?
+
+  // Animation
+  animationUrl   String?
+
+  // Scan association
+  scanJobId String?
+  scanJob   ScanJob? @relation(fields: [scanJobId], references: [id])
+
+  userId        String
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  solarAnalysis SolarAnalysis?
+  proposals     Proposal[]
+  campaignLeads CampaignLead[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SolarAnalysis {
+  id     String @id @default(cuid())
+  leadId String @unique
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  roofAreaSqM                Float?
+  maxPanelCount              Int?
+  usableSunshineHoursPerYear Float?
+  carbonOffsetFactorKgPerMwh Float?
+
+  panelCount        Int?
+  panelWattage      Int?
+  systemCapacityKw  Float?
+  annualOutputKwh   Float?
+
+  annualSavingsUsd     Float?
+  systemCostUsd        Float?
+  incentiveAmountUsd   Float?
+  netCostUsd           Float?
+  paybackYears         Float?
+  roiPercent           Float?
+  co2OffsetTonsPerYear Float?
+
+  rawSolarData         Json?
+  panelLayout          Json?
+  satelliteImageUrl    String?
+  uploadedImageUrl     String?
+  detectedZones        Json?
+  userInputRoofAreaSqM Float?
+  selectedZones        Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Proposal {
+  id     String @id @default(cuid())
+  leadId String
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title         String
+  status        ProposalStatus @default(DRAFT)
+  customMessage String?
+  validUntil    DateTime?
+  shareToken    String?        @unique
+
+  panelCount           Int?
+  systemCapacityKw     Float?
+  annualOutputKwh      Float?
+  annualSavingsUsd     Float?
+  systemCostUsd        Float?
+  incentiveAmountUsd   Float?
+  netCostUsd           Float?
+  paybackYears         Float?
+  roiPercent           Float?
+  co2OffsetTonsPerYear Float?
+  electricityRate      Float?
+  panelWattage         Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ScanJob {
+  id            String        @id @default(cuid())
+  userId        String
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name          String
+  method        ScanMethod
+  query         String?
+  centerAddress String?
+  radiusMiles   Float?
+  polygon       Json?
+  status        ScanJobStatus @default(PENDING)
+  totalFound    Int           @default(0)
+  totalScored   Int           @default(0)
+  error         String?
+  leads         Lead[]
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+}
+
+model OutreachCampaign {
+  id           String         @id @default(cuid())
+  userId       String
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name         String
+  status       CampaignStatus @default(DRAFT)
+  subject      String
+  bodyTemplate String
+  calendlyLink String?
+  fromName     String?
+  fromEmail    String?
+  sentCount    Int            @default(0)
+  openCount    Int            @default(0)
+  clickCount   Int            @default(0)
+  leads        CampaignLead[]
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+}
+
+model CampaignLead {
+  id           String           @id @default(cuid())
+  campaignId   String
+  campaign     OutreachCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  leadId       String
+  lead         Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  status       EmailStatus      @default(QUEUED)
+  sentAt       DateTime?
+  openedAt     DateTime?
+  clickedAt    DateTime?
+  bookedAt     DateTime?
+  resendId     String?
+  animationUrl String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@unique([campaignId, leadId])
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum LeadStatus {
+  NEW
+  ANALYZING
+  ANALYZED
+  PROPOSAL_SENT
+  WON
+  LOST
+}
+
+enum ProposalStatus {
+  DRAFT
+  SENT
+  VIEWED
+  ACCEPTED
+  REJECTED
+}
+
+enum ScanMethod {
+  RADIUS
+  POLYGON
+  CSV
+}
+
+enum ScanJobStatus {
+  PENDING
+  RUNNING
+  SCORING
+  COMPLETED
+  FAILED
+}
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  OPENED
+  CLICKED
+  BOOKED
+  BOUNCED
+}

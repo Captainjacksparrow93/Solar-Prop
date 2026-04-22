@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(npm list:*)",
+      "Bash(vercel logs:*)",
+      "Bash(vercel status:*)",
+      "Bash(vercel list:*)",
+      "Bash(vercel deploy:*)",
+      "Bash(vercel env:*)",
+      "Bash(npx prisma:*)",
+      "Bash(ls -la prisma*)",
+      "Bash(head -20 prisma.config.ts)",
+      "Bash(DATABASE_URL=\"postgresql://neondb_owner:npg_KSfeg4aYZs8h@ep-bold-union-amucrfux-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require\" npx prisma db push --skip-generate)",
+      "Bash(curl -X POST https://solar-prop-one.vercel.app/api/seed -H 'Content-Type: application/json' -H 'x-seed-secret: solar-seed-2026' -d '{:*)",
+      "Bash(curl -s https://solar-prop-one.vercel.app/dashboard)",
+      "Bash(npm install:*)",
+      "Bash(node -e \"require\\('resend'\\)\")",
+      "Bash(node -e \"require\\('sharp'\\); console.log\\('sharp OK'\\)\")",
+      "Bash(curl:*)",
+      "Bash(python -m json.tool)",
+      "Bash(vercel --prod --force)",
+      "Bash(python -c \" import sys, json data = json.load\\(sys.stdin\\) leads = data.get\\('leads', []\\) for l in leads: if l.get\\('solarAnalysis'\\) and l['solarAnalysis'].get\\('rawSolarData'\\): raw = l['solarAnalysis']['rawSolarData'] print\\('HAS RAW DATA'\\) print\\('Keys:', list\\(raw.keys\\(\\)\\) if isinstance\\(raw, dict\\) else type\\(raw\\)\\) if isinstance\\(raw, dict\\) and 'solarPotential' in raw: sp = raw['solarPotential'] segs = sp.get\\('roofSegmentStats', []\\) print\\('Roof segments:', len\\(segs\\)\\) if segs: print\\('First segment:', json.dumps\\(segs[0], indent=2\\)[:500]\\) break elif l.get\\('solarAnalysis'\\): print\\('Has analysis but no rawSolarData, lat:', l.get\\('lat'\\)\\) \")",
+      "Bash(python -c \" import sys, json data = json.load\\(sys.stdin\\) leads = data.get\\('leads', []\\) print\\('Total leads:', len\\(leads\\)\\) for l in leads[:3]: print\\('Lead:', l['businessName'], '| lat:', l.get\\('lat'\\), '| roofScore:', l.get\\('roofScore'\\), '| analysis:', bool\\(l.get\\('solarAnalysis'\\)\\)\\) if l.get\\('solarAnalysis'\\): a = l['solarAnalysis'] print\\(' roofAreaSqM:', a.get\\('roofAreaSqM'\\), '| panelCount:', a.get\\('panelCount'\\)\\) print\\(' hasRawData:', bool\\(a.get\\('rawSolarData'\\)\\)\\) \")"
+    ]
+  }
+}
