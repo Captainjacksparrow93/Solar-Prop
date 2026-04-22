@@ -4,7 +4,7 @@ import { useState, useCallback } from "react";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { Radar, Play, Loader2, CheckCircle, XCircle, Clock, ChevronRight } from "lucide-react";
+import { Radar, Play, Loader2, CheckCircle, XCircle, Clock, ChevronRight, Trash2 } from "lucide-react";
 import { toast } from "@/components/ui/Toaster";
 
 // Load leaflet map client-side only (leaflet needs window)
@@ -42,6 +42,7 @@ const BUSINESS_TYPES = [
 export function ScanDashboard({ initialJobs }: Props) {
   const router = useRouter();
   const [jobs, setJobs] = useState<ScanJob[]>(initialJobs);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"RADIUS" | "POLYGON" | "CSV">("RADIUS");
   const [phase, setPhase] = useState<"idle" | "finding" | "done">("idle");
 
@@ -107,6 +108,26 @@ export function ScanDashboard({ initialJobs }: Props) {
     } catch {
       toast("Network error", "error");
       setPhase("idle");
+    }
+  }
+
+  async function deleteJob(jobId: string, e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this scan and detach its leads?")) return;
+    setDeletingId(jobId);
+    try {
+      const res = await fetch(`/api/scan/jobs/${jobId}`, { method: "DELETE" });
+      if (res.ok) {
+        setJobs(prev => prev.filter(j => j.id !== jobId));
+        toast("Scan deleted", "success");
+      } else {
+        toast("Failed to delete scan", "error");
+      }
+    } catch {
+      toast("Network error", "error");
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -269,23 +290,34 @@ export function ScanDashboard({ initialJobs }: Props) {
           </div>
           <div className="divide-y divide-slate-800">
             {jobs.map(job => (
-              <Link key={job.id} href={`/scan/${job.id}`}
-                className="flex items-center gap-4 px-6 py-4 hover:bg-slate-800/30 transition-colors">
-                {statusIcon(job.status)}
-                <div className="flex-1 min-w-0">
-                  <p className="text-white font-medium text-sm truncate">{job.name}</p>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    {job.method} · {job.totalFound} found · {job.totalScored} scored ·{" "}
-                    {new Date(job.createdAt).toLocaleDateString()}
-                  </p>
-                </div>
-                <span className={`text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${
-                  job.status === "COMPLETED" ? "bg-green-500/10 text-green-400" :
-                  job.status === "FAILED"    ? "bg-red-500/10 text-red-400" :
-                                              "bg-orange-500/10 text-orange-400"
-                }`}>{job.status}</span>
-                <ChevronRight className="w-4 h-4 text-slate-600 shrink-0" />
-              </Link>
+              <div key={job.id} className="flex items-center gap-4 px-6 py-4 hover:bg-slate-800/30 transition-colors group">
+                <Link href={`/scan/${job.id}`} className="flex items-center gap-4 flex-1 min-w-0">
+                  {statusIcon(job.status)}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-white font-medium text-sm truncate">{job.name}</p>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {job.method} · {job.totalFound} found · {job.totalScored} scored ·{" "}
+                      {new Date(job.createdAt).toLocaleDateString()}
+                    </p>
+                  </div>
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${
+                    job.status === "COMPLETED" ? "bg-green-500/10 text-green-400" :
+                    job.status === "FAILED"    ? "bg-red-500/10 text-red-400" :
+                                                "bg-orange-500/10 text-orange-400"
+                  }`}>{job.status}</span>
+                  <ChevronRight className="w-4 h-4 text-slate-600 shrink-0" />
+                </Link>
+                <button
+                  onClick={(e) => deleteJob(job.id, e)}
+                  disabled={deletingId === job.id}
+                  className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-500/10 transition-all shrink-0 disabled:opacity-50"
+                  title="Delete scan"
+                >
+                  {deletingId === job.id
+                    ? <Loader2 className="w-4 h-4 animate-spin" />
+                    : <Trash2 className="w-4 h-4" />}
+                </button>
+              </div>
             ))}
           </div>
         </div>

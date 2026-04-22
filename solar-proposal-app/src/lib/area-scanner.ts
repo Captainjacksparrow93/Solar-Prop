@@ -1,7 +1,13 @@
 /**
- * Area Scanner — OpenStreetMap Overpass API.
- * Searches for commercial/industrial buildings using broad tags so it
- * works in cities where buildings are only tagged `building=yes`.
+ * Area Scanner — multi-source building discovery.
+ *
+ * Source priority:
+ *   1. Google Places API (Text Search + Nearby Search) — most reliable, real business data
+ *   2. OpenStreetMap Overpass API                      — free, good for dense industrial areas
+ *   3. Nominatim search                                — lightweight fallback
+ *
+ * Google Places is tried first when GOOGLE_SOLAR_API_KEY is set (same key used for Solar API).
+ * Overpass requires a User-Agent header to avoid 429 rate-limits.
  */
 
 export interface PlaceResult {
@@ -27,7 +33,9 @@ interface LatLng { lat: number; lng: number }
 export async function geocodeAddress(address: string): Promise<LatLng | null> {
   const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
   const res = await fetch(url, {
-    headers: { "User-Agent": "SolarPropose/1.0 (solar-prop-one.vercel.app)" },
+    headers: {
+      "User-Agent": "SolarPropose/1.0 (solar-prop-one.vercel.app; contact@solarpropose.com)",
+    },
     signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) return null;
@@ -36,30 +44,205 @@ export async function geocodeAddress(address: string): Promise<LatLng | null> {
   return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
 }
 
+// ─── Google Places — primary source ──────────────────────────────────────────
+
+/**
+ * Maps the free-text query hint to Google Places includedTypes for Nearby Search.
+ */
+function queryToGoogleTypes(queryHint: string): string[] {
+  const map: Record<string, string[]> = {
+    warehouse:              ["warehouse", "storage"],
+    "manufacturing plant":  ["manufacturing_plant", "factory"],
+    factory:                ["manufacturing_plant", "factory"],
+    "industrial building":  ["warehouse", "manufacturing_plant"],
+    "office building":      ["office"],
+    "shopping mall":        ["shopping_mall"],
+    supermarket:            ["supermarket", "grocery_store"],
+    hotel:                  ["hotel"],
+    hospital:               ["hospital"],
+    school:                 ["school", "university", "college"],
+    church:                 ["church", "place_of_worship"],
+    "storage facility":     ["warehouse", "storage"],
+    "distribution center":  ["warehouse"],
+  };
+  return map[queryHint.toLowerCase()] ?? [];
+}
+
+interface GoogleRawPlace {
+  id: string;
+  displayName?: { text: string };
+  formattedAddress?: string;
+  addressComponents?: Array<{ longText?: string; types?: string[] }>;
+  location?: { latitude: number; longitude: number };
+  internationalPhoneNumber?: string;
+  websiteUri?: string;
+  primaryTypeDisplayName?: { text: string };
+  rating?: number;
+  userRatingCount?: number;
+}
+
+function parseGooglePlace(p: GoogleRawPlace): PlaceResult {
+  const components = p.addressComponents ?? [];
+  const get = (type: string) =>
+    components.find((c) => c.types?.includes(type))?.longText ?? null;
+
+  return {
+    placeId:      p.id,
+    businessName: p.displayName?.text ?? "Unknown",
+    address:      p.formattedAddress ?? "",
+    city:         get("locality") ?? get("postal_town") ?? get("administrative_area_level_2"),
+    state:        get("administrative_area_level_1"),
+    country:      get("country"),
+    lat:          p.location?.latitude ?? 0,
+    lng:          p.location?.longitude ?? 0,
+    phone:        p.internationalPhoneNumber ?? null,
+    website:      p.websiteUri ?? null,
+    businessType: p.primaryTypeDisplayName?.text ?? null,
+    rating:       p.rating ?? null,
+    totalRatings: p.userRatingCount ?? null,
+  };
+}
+
+const PLACES_FIELD_MASK =
+  "places.id,places.displayName,places.formattedAddress,places.addressComponents," +
+  "places.location,places.internationalPhoneNumber,places.websiteUri," +
+  "places.primaryTypeDisplayName,places.rating,places.userRatingCount";
+
+/**
+ * Google Places Nearby Search — returns commercial buildings near a point.
+ * Paginates up to 3 pages (60 results) if needed.
+ */
+async function searchGoogleNearby(
+  apiKey: string,
+  queryHint: string,
+  center: LatLng,
+  radiusMeters: number,
+  maxResults: number,
+): Promise<PlaceResult[]> {
+  const includedTypes = queryToGoogleTypes(queryHint);
+  const results: PlaceResult[] = [];
+  let pageToken: string | undefined;
+
+  // If no specific type mapping, fall back to text search
+  if (includedTypes.length === 0) {
+    return searchGoogleText(apiKey, queryHint, center, radiusMeters, maxResults);
+  }
+
+  while (results.length < maxResults) {
+    const body: Record<string, unknown> = {
+      includedTypes,
+      maxResultCount: 20,
+      locationRestriction: {
+        circle: {
+          center: { latitude: center.lat, longitude: center.lng },
+          radius: Math.min(radiusMeters, 50000),
+        },
+      },
+    };
+    if (pageToken) body.pageToken = pageToken;
+
+    const res = await fetch("https://places.googleapis.com/v1/places:searchNearby", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": apiKey,
+        "X-Goog-FieldMask": PLACES_FIELD_MASK + ",nextPageToken",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!res.ok) throw new Error(`Google Places Nearby: HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(`Google Places Nearby: ${data.error.message}`);
+
+    const batch: PlaceResult[] = (data.places ?? []).map(parseGooglePlace);
+    results.push(...batch);
+    pageToken = data.nextPageToken;
+    if (!pageToken || batch.length === 0) break;
+  }
+
+  return results.slice(0, maxResults);
+}
+
+/**
+ * Google Places Text Search — used when no specific type mapping exists
+ * or as a supplement. Returns up to 20 results per call.
+ */
+async function searchGoogleText(
+  apiKey: string,
+  queryHint: string,
+  center: LatLng,
+  radiusMeters: number,
+  maxResults: number,
+): Promise<PlaceResult[]> {
+  const results: PlaceResult[] = [];
+  let pageToken: string | undefined;
+
+  while (results.length < maxResults) {
+    const body: Record<string, unknown> = {
+      textQuery: queryHint,
+      maxResultCount: Math.min(20, maxResults - results.length),
+      locationBias: {
+        circle: {
+          center: { latitude: center.lat, longitude: center.lng },
+          radius: Math.min(radiusMeters, 50000),
+        },
+      },
+    };
+    if (pageToken) body.pageToken = pageToken;
+
+    const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": apiKey,
+        "X-Goog-FieldMask": PLACES_FIELD_MASK + ",nextPageToken",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!res.ok) throw new Error(`Google Places Text: HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(`Google Places Text: ${data.error.message}`);
+
+    const batch: PlaceResult[] = (data.places ?? []).map(parseGooglePlace);
+    results.push(...batch);
+    pageToken = data.nextPageToken;
+    if (!pageToken || batch.length === 0) break;
+  }
+
+  return results.slice(0, maxResults);
+}
+
 // ─── Overpass mirrors — queried in parallel, best result wins ─────────────────
-//
-// Sequential probing meant a slow/overloaded mirror consumed 30 s before the
-// next was tried. On Vercel functions this frequently exhausted the 60 s budget.
-// Parallel probing returns as soon as ANY mirror delivers useful data.
 
 const OVERPASS_MIRRORS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
   "https://overpass.openstreetmap.ru/api/interpreter",
-  "https://maps.mail.ru/osm/tools/overpass/api/interpreter", // extra mirror
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ];
 
-async function querySingleMirror(mirror: string, query: string, timeoutMs: number): Promise<any[]> {
+// All public Overpass instances require a meaningful User-Agent to avoid 429s
+const OVERPASS_USER_AGENT =
+  "SolarPropose/1.0 (solar-prop-one.vercel.app; contact@solarpropose.com)";
+
+async function querySingleMirror(mirror: string, query: string): Promise<any[]> {
   try {
     const res = await fetch(mirror, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": OVERPASS_USER_AGENT,
+      },
       body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(45000),
     });
     if (!res.ok) return [];
     const text = await res.text();
-    if (text.trim().startsWith("<")) return []; // HTML error page
+    if (text.trim().startsWith("<")) return [];
     const data = JSON.parse(text);
     return data.elements ?? [];
   } catch {
@@ -68,20 +251,17 @@ async function querySingleMirror(mirror: string, query: string, timeoutMs: numbe
 }
 
 async function queryOverpass(query: string): Promise<any[]> {
-  // Race all mirrors simultaneously; return the first response with ≥1 element.
-  // If multiple mirrors answer, the fastest one wins.
   return new Promise((resolve) => {
     let settled = false;
     let pending = OVERPASS_MIRRORS.length;
 
     OVERPASS_MIRRORS.forEach((mirror) => {
-      querySingleMirror(mirror, query, 45000).then((elements) => {
+      querySingleMirror(mirror, query).then((elements) => {
         pending--;
         if (!settled && elements.length > 0) {
           settled = true;
           resolve(elements);
         } else if (pending === 0 && !settled) {
-          // All mirrors returned empty — resolve with empty array
           resolve([]);
         }
       });
@@ -91,27 +271,13 @@ async function queryOverpass(query: string): Promise<any[]> {
 
 // ─── Build Overpass query ─────────────────────────────────────────────────────
 
-/**
- * Builds a query that finds commercial / industrial buildings regardless of
- * how they are tagged in OSM.  Works in cities that only use `building=yes`.
- *
- * Strategy:
- *   1. Any building that is NOT residential/agricultural
- *   2. Named amenities (hospital, hotel, school, etc.)
- *   3. Named shops / offices
- *
- * The residential exclusion list covers the most common residential tags so
- * we don't return individual houses in dense neighbourhoods.
- */
 function buildQuery(center: LatLng, radiusMeters: number, maxResults: number, queryHint: string): string {
-  const r    = Math.min(radiusMeters, 50000);
-  const lat  = center.lat;
-  const lng  = center.lng;
+  const r   = Math.min(radiusMeters, 50000);
+  const lat = center.lat;
+  const lng = center.lng;
 
-  // Residential tags to exclude
   const EXCL = "house|residential|apartments|detached|semidetached_house|terrace|bungalow|hut|shed|garage|garages|carport|cabin|dormitory|farm|allotment_house|static_caravan";
 
-  // Map hint to targeted Overpass tags (tried first, faster)
   const HINT_TAGS: Record<string, string> = {
     warehouse:            `["building"~"warehouse|industrial|storage"]`,
     "manufacturing plant":`["building"~"industrial|factory|manufacture"]`,
@@ -129,16 +295,12 @@ function buildQuery(center: LatLng, radiusMeters: number, maxResults: number, qu
   };
 
   const targetTag = HINT_TAGS[queryHint.toLowerCase()] ?? null;
-
   const around = `(around:${r},${lat},${lng})`;
 
-  // Primary targeted query (if we have a specific tag for this type)
   const targeted = targetTag
     ? `  way${targetTag}${around};\n  node${targetTag}${around};`
     : "";
 
-  // Broad non-residential building query — catches `building=yes` which is
-  // the dominant tag in most of Asia, Africa, and Latin America
   const broad = `
   way["building"]["building"!~"^(${EXCL})$"]${around};
   node["building"]["building"!~"^(${EXCL})$"]${around};
@@ -149,8 +311,6 @@ function buildQuery(center: LatLng, radiusMeters: number, maxResults: number, qu
   way["office"]${around};
   node["office"]${around};`;
 
-  // Use out center body (not just qt) so way elements include full tag set.
-  // Double maxResults in query to give dedup room; parseElements slices to actual limit.
   return `[out:json][timeout:45];\n(\n${targeted}\n${broad}\n);\nout center body qt ${maxResults * 2};`;
 }
 
@@ -165,7 +325,6 @@ function parseElements(elements: any[]): PlaceResult[] {
     const lon = el.lon ?? el.center?.lon;
     if (!lat || !lon) continue;
 
-    // Deduplicate by rounded position
     const key = `${lat.toFixed(4)},${lon.toFixed(4)}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -208,9 +367,7 @@ function parseElements(elements: any[]): PlaceResult[] {
   return results;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-// ─── Nominatim search fallback (when Overpass is down) ───────────────────────
+// ─── Nominatim search fallback ────────────────────────────────────────────────
 
 async function searchNominatim(
   query: string,
@@ -218,18 +375,18 @@ async function searchNominatim(
   radiusMiles: number,
   maxResults: number
 ): Promise<PlaceResult[]> {
-  const deg  = (radiusMiles * 1609.34) / 111320; // approx degrees per metre
+  const deg  = (radiusMiles * 1609.34) / 111320;
   const bbox = [
     center.lng - deg, center.lat - deg,
     center.lng + deg, center.lat + deg,
   ].join(",");
 
-  const url  = `https://nominatim.openstreetmap.org/search` +
+  const url = `https://nominatim.openstreetmap.org/search` +
     `?q=${encodeURIComponent(query)}` +
     `&viewbox=${bbox}&bounded=1&format=json&limit=${maxResults}&addressdetails=1`;
 
-  const res  = await fetch(url, {
-    headers: { "User-Agent": "SolarPropose/1.0 (solar-prop-one.vercel.app)" },
+  const res = await fetch(url, {
+    headers: { "User-Agent": OVERPASS_USER_AGENT },
     signal: AbortSignal.timeout(12000),
   });
   if (!res.ok) return [];
@@ -264,6 +421,8 @@ async function searchNominatim(
     .filter(Boolean) as PlaceResult[];
 }
 
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 export async function scanByRadius(
   query: string,
   centerAddress: string,
@@ -274,15 +433,37 @@ export async function scanByRadius(
   if (!center) throw new Error(`Could not geocode: "${centerAddress}". Try a more specific city name or address.`);
 
   const radiusMeters = radiusMiles * 1609.34;
+  const apiKey = process.env.GOOGLE_SOLAR_API_KEY;
 
-  // Try Overpass first (comprehensive OSM building data)
+  // ── 1. Google Places (primary — reliable, rich data) ─────────────────────
+  if (apiKey) {
+    try {
+      const googleResults = await searchGoogleNearby(apiKey, query, center, radiusMeters, maxResults);
+      if (googleResults.length >= 5) {
+        console.log(`[scan] Google Places returned ${googleResults.length} results`);
+        return googleResults;
+      }
+      // If nearby returned too few, try text search
+      const textResults = await searchGoogleText(apiKey, query, center, radiusMeters, maxResults);
+      if (textResults.length >= 3) {
+        console.log(`[scan] Google Places Text returned ${textResults.length} results`);
+        return textResults;
+      }
+    } catch (e) {
+      console.warn(`[scan] Google Places failed (${(e as Error).message}), falling back to Overpass`);
+    }
+  }
+
+  // ── 2. Overpass (fallback — OSM data, requires User-Agent) ───────────────
   const overpassQuery = buildQuery(center, radiusMeters, maxResults * 2, query);
-  let elements = await queryOverpass(overpassQuery);
-  let results  = elements.length > 0 ? parseElements(elements).slice(0, maxResults) : [];
+  const elements = await queryOverpass(overpassQuery);
+  let results = elements.length > 0 ? parseElements(elements).slice(0, maxResults) : [];
+  console.log(`[scan] Overpass returned ${elements.length} elements → ${results.length} parsed`);
 
-  // Fallback to Nominatim search if Overpass returned nothing
+  // ── 3. Nominatim (last resort) ────────────────────────────────────────────
   if (results.length === 0) {
     results = await searchNominatim(query, center, radiusMiles, maxResults);
+    console.log(`[scan] Nominatim returned ${results.length} results`);
   }
 
   if (results.length === 0) {
@@ -309,10 +490,30 @@ export async function scanByPolygon(
   const latSpan = (Math.max(...lats) - Math.min(...lats)) * 111000;
   const lngSpan = (Math.max(...lngs) - Math.min(...lngs)) * 111000;
   const radiusMeters = Math.sqrt(latSpan ** 2 + lngSpan ** 2) / 2;
+  const radiusMiles  = radiusMeters / 1609.34;
 
-  const overpassQuery = buildQuery(center, radiusMeters, maxResults * 2, query);
-  const elements = await queryOverpass(overpassQuery);
-  return parseElements(elements)
+  const apiKey = process.env.GOOGLE_SOLAR_API_KEY;
+
+  let candidates: PlaceResult[] = [];
+
+  if (apiKey) {
+    try {
+      candidates = await searchGoogleNearby(apiKey, query, center, radiusMeters, maxResults * 2);
+      if (candidates.length < 5) {
+        candidates = await searchGoogleText(apiKey, query, center, radiusMeters, maxResults * 2);
+      }
+    } catch {
+      /* fall through to Overpass */
+    }
+  }
+
+  if (candidates.length === 0) {
+    const overpassQuery = buildQuery(center, radiusMeters, maxResults * 2, query);
+    const elements = await queryOverpass(overpassQuery);
+    candidates = elements.length > 0 ? parseElements(elements) : [];
+  }
+
+  return candidates
     .filter(r => isInsidePolygon({ lat: r.lat, lng: r.lng }, polygon))
     .slice(0, maxResults);
 }
