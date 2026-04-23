@@ -5,8 +5,8 @@ import Link from "next/link";
 import {
   Radar, Loader2, ChevronLeft,
   Building2, Sun, DollarSign, AlertTriangle,
-  CheckCircle, User, Mail, Clock,
-  RefreshCw, Eye, Sparkles,
+  CheckCircle, User, Mail,
+  Eye, Sparkles,
 } from "lucide-react";
 import { toast } from "@/components/ui/Toaster";
 import { formatCurrency } from "@/lib/utils";
@@ -167,6 +167,7 @@ export function LiveActivityDashboard({ jobId, jobName, jobStatus, initialLeads 
 
   const [scoring, setScoring] = useState(false);
   const [progress, setProgress] = useState({ scored: 0, total: initialLeads.length });
+  const [previewError, setPreviewError] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -252,15 +253,19 @@ export function LiveActivityDashboard({ jobId, jobName, jobStatus, initialLeads 
       const d = await r.json();
       if (!r.ok) { toast(d.error || "Failed", "error"); return; }
       toast("Visual generated!", "success");
+      setPreviewError(false);
       await refresh();
     } catch { toast("Network error", "error"); }
     finally { setAnimating(null); }
   }
 
-  // Satellite image URL
-  const satelliteUrl = selectedLead?.lat && selectedLead?.lng
-    ? `/api/satellite?lat=${selectedLead.lat}&lng=${selectedLead.lng}&zoom=19`
+  // Visual URL: satellite image composited with per-building customised panels
+  const previewImageUrl = selectedLead?.lat && selectedLead?.lng
+    ? (selectedLead.animationUrl ?? `/api/leads/${selectedLead.id}/visual`)
     : null;
+
+  // Reset error state whenever the selected lead changes
+  useEffect(() => { setPreviewError(false); }, [selectedLead?.id]);
 
   const displayLeads = tab === "itc" ? itcLeads : tab === "prospects" ? highPriority : leads;
 
@@ -425,15 +430,18 @@ export function LiveActivityDashboard({ jobId, jobName, jobStatus, initialLeads 
               onClick={() => setModal({
                 leadId: selectedLead.id,
                 leadName: selectedLead.businessName,
-                url: selectedLead.animationUrl ?? satelliteUrl,
+                url: selectedLead.animationUrl ?? null,
                 generate: false,
               })}
             >
-              {selectedLead.animationUrl ? (
-                <img src={selectedLead.animationUrl} alt="Building with solar panels" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />
-              ) : satelliteUrl ? (
-                <img src={satelliteUrl} alt="Satellite view" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                  onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
+              {!previewError && previewImageUrl ? (
+                <img
+                  key={selectedLead.id}
+                  src={previewImageUrl}
+                  alt="Building with solar panels"
+                  className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                  onError={() => setPreviewError(true)}
+                />
               ) : (
                 <div className="w-full h-full flex items-center justify-center">
                   <Building2 className="w-12 h-12 text-slate-700" />
