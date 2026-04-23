@@ -35,10 +35,12 @@ function getSatelliteUrl(lat: number, lng: number, zoom: number) {
 function generatePanelGrid(count: number, canvasW: number, canvasH: number): Panel[] {
   const panels: Panel[] = [];
   const cols = Math.ceil(Math.sqrt(count * 2));
-  const startX = canvasW * 0.15;
-  const startY = canvasH * 0.2;
   const gapX = PANEL_W + 4;
   const gapH = PANEL_H + 4;
+  const rows = Math.ceil(count / cols);
+  // Centre the grid on the canvas — the building is always at the centre of the satellite image
+  const startX = Math.round((canvasW - (cols * gapX - 4)) / 2);
+  const startY = Math.round((canvasH - (rows * gapH - 4)) / 2);
 
   for (let i = 0; i < count; i++) {
     const col = i % cols;
