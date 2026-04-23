@@ -4,7 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import {
   ChevronLeft, Loader2, Users, Sparkles, Send,
-  CheckCircle, AlertCircle, Building2, Zap,
+  CheckCircle, Building2,
 } from "lucide-react";
 import { toast } from "@/components/ui/Toaster";
 import { formatCurrency, formatNumber } from "@/lib/utils";
