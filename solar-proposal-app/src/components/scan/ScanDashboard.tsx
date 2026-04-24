@@ -34,9 +34,12 @@ interface ScanJob {
 interface Props { initialJobs: ScanJob[] }
 
 const BUSINESS_TYPES = [
+  // Commercial / Industrial
   "warehouse", "manufacturing plant", "factory", "industrial building",
   "office building", "shopping mall", "supermarket", "hotel", "hospital",
   "school", "church", "storage facility", "distribution center",
+  // Residential
+  "residential complex", "apartment complex", "housing society", "apartments",
 ];
 
 export function ScanDashboard({ initialJobs }: Props) {

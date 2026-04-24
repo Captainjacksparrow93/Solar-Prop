@@ -64,6 +64,12 @@ function queryToGoogleTypes(queryHint: string): string[] {
     church:                 ["church", "place_of_worship"],
     "storage facility":     ["warehouse", "storage"],
     "distribution center":  ["warehouse"],
+    // Residential types
+    "residential complex":  ["apartment_complex"],
+    "apartment complex":    ["apartment_complex"],
+    "housing society":      ["apartment_complex"],
+    residential:            ["apartment_complex"],
+    apartments:             ["apartment_complex"],
   };
   return map[queryHint.toLowerCase()] ?? [];
 }
@@ -275,6 +281,22 @@ function buildQuery(center: LatLng, radiusMeters: number, maxResults: number, qu
   const r   = Math.min(radiusMeters, 50000);
   const lat = center.lat;
   const lng = center.lng;
+  const q   = queryHint.toLowerCase();
+  const around = `(around:${r},${lat},${lng})`;
+
+  // Residential queries get a dedicated query targeting multi-unit buildings
+  const isResidential = q.includes("residential") || q.includes("apartment") ||
+                        q.includes("housing") || q === "apartments";
+  if (isResidential) {
+    return `[out:json][timeout:45];
+(
+  way["building"~"apartments|residential|flats|flat|dormitory"]["building"!~"^(hut|shed|garage|carport|static_caravan)$"]${around};
+  node["building"~"apartments|residential|flats|flat|dormitory"]["building"!~"^(hut|shed|garage|carport|static_caravan)$"]${around};
+  way["residential"="apartments"]${around};
+  node["residential"="apartments"]${around};
+);
+out center body qt ${maxResults * 2};`;
+  }
 
   const EXCL = "house|residential|apartments|detached|semidetached_house|terrace|bungalow|hut|shed|garage|garages|carport|cabin|dormitory|farm|allotment_house|static_caravan";
 
@@ -294,8 +316,7 @@ function buildQuery(center: LatLng, radiusMeters: number, maxResults: number, qu
     "distribution center":`["building"~"warehouse|industrial"]`,
   };
 
-  const targetTag = HINT_TAGS[queryHint.toLowerCase()] ?? null;
-  const around = `(around:${r},${lat},${lng})`;
+  const targetTag = HINT_TAGS[q] ?? null;
 
   const targeted = targetTag
     ? `  way${targetTag}${around};\n  node${targetTag}${around};`

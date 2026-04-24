@@ -61,41 +61,54 @@ async function fetchEsriTile(z: number, ty: number, tx: number): Promise<Buffer 
 }
 
 async function buildSatelliteBuffer(lat: number, lng: number): Promise<Buffer> {
-  const { x: xf, y: yf } = latLngToTileFloat(lat, lng, ZOOM);
-  const tileX = Math.floor(xf);
-  const tileY = Math.floor(yf);
-  const GRID  = 3;
-  const half  = 1;
+  // ── 1. Google Maps Static API — best global coverage ──────────────────────
+  const apiKey = process.env.GOOGLE_SOLAR_API_KEY;
+  if (apiKey) {
+    try {
+      const url =
+        `https://maps.googleapis.com/maps/api/staticmap` +
+        `?center=${lat},${lng}&zoom=${ZOOM}&size=${CANVAS_W}x${CANVAS_H}&maptype=satellite&key=${apiKey}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(9000) });
+      if (res.ok) return Buffer.from(await res.arrayBuffer());
+    } catch { /* fall through to ESRI */ }
+  }
 
-  const composites: Array<{ input: Buffer; left: number; top: number }> = [];
-  await Promise.all(
-    Array.from({ length: GRID }, (_, row) =>
-      Array.from({ length: GRID }, async (_, col) => {
-        const buf = await fetchEsriTile(ZOOM, tileY + row - half, tileX + col - half);
-        if (buf) composites.push({ input: buf, left: col * TILE_SIZE, top: row * TILE_SIZE });
-      })
-    ).flat()
-  );
+  // ── 2. ESRI World Imagery — try zoom 19 then 18 ───────────────────────────
+  for (const zoom of [ZOOM, ZOOM - 1]) {
+    try {
+      const { x: xf, y: yf } = latLngToTileFloat(lat, lng, zoom);
+      const tileX = Math.floor(xf);
+      const tileY = Math.floor(yf);
+      const GRID = 3, half = 1;
+      const composites: Array<{ input: Buffer; left: number; top: number }> = [];
+      await Promise.all(
+        Array.from({ length: GRID }, (_, row) =>
+          Array.from({ length: GRID }, async (_, col) => {
+            const buf = await fetchEsriTile(zoom, tileY + row - half, tileX + col - half);
+            if (buf) composites.push({ input: buf, left: col * TILE_SIZE, top: row * TILE_SIZE });
+          })
+        ).flat()
+      );
+      const totalW = TILE_SIZE * GRID;
+      const totalH = TILE_SIZE * GRID;
+      const stitched = await sharp({
+        create: { width: totalW, height: totalH, channels: 3, background: { r: 20, g: 25, b: 30 } },
+      }).composite(composites).png().toBuffer();
+      const centerPxX = (xf - (tileX - half)) * TILE_SIZE;
+      const centerPxY = (yf - (tileY - half)) * TILE_SIZE;
+      const cropX = Math.max(0, Math.min(totalW - CANVAS_W, Math.round(centerPxX - CANVAS_W / 2)));
+      const cropY = Math.max(0, Math.min(totalH - CANVAS_H, Math.round(centerPxY - CANVAS_H / 2)));
+      return await sharp(stitched)
+        .extract({ left: cropX, top: cropY, width: CANVAS_W, height: CANVAS_H })
+        .png()
+        .toBuffer();
+    } catch { /* try lower zoom */ }
+  }
 
-  const totalW = TILE_SIZE * GRID;
-  const totalH = TILE_SIZE * GRID;
-
-  const stitched = await sharp({
-    create: { width: totalW, height: totalH, channels: 3, background: { r: 20, g: 25, b: 30 } },
-  })
-    .composite(composites)
-    .png()
-    .toBuffer();
-
-  const centerPxX = (xf - (tileX - half)) * TILE_SIZE;
-  const centerPxY = (yf - (tileY - half)) * TILE_SIZE;
-  const cropX = Math.max(0, Math.min(totalW - CANVAS_W, Math.round(centerPxX - CANVAS_W / 2)));
-  const cropY = Math.max(0, Math.min(totalH - CANVAS_H, Math.round(centerPxY - CANVAS_H / 2)));
-
-  return sharp(stitched)
-    .extract({ left: cropX, top: cropY, width: CANVAS_W, height: CANVAS_H })
-    .png()
-    .toBuffer();
+  // Solid fallback
+  return sharp({
+    create: { width: CANVAS_W, height: CANVAS_H, channels: 3, background: { r: 20, g: 25, b: 30 } },
+  }).png().toBuffer();
 }
 
 // ─── Point-in-polygon ────────────────────────────────────────────────────────
@@ -307,6 +320,40 @@ function projectSolarSegments(
   return { x: Math.max(0, x), y: Math.max(HEADER_H, y), w, h };
 }
 
+// ─── Sun direction helpers ────────────────────────────────────────────────────
+
+/**
+ * Extracts the azimuth of the best (largest, <40° pitch) roof segment.
+ * Falls back to due-south for Northern Hemisphere, due-north for Southern.
+ */
+function getOptimalAzimuth(rawSolarData: unknown, lat: number): number {
+  const segments: any[] = (rawSolarData as any)?.solarPotential?.roofSegmentStats ?? [];
+  const best = segments
+    .filter((s: any) => (s.pitchDegrees ?? 90) < 40)
+    .sort((a: any, b: any) => (b.stats?.areaMeters2 ?? 0) - (a.stats?.areaMeters2 ?? 0))[0];
+  if (best?.azimuthDegrees !== undefined) return best.azimuthDegrees;
+  return lat >= 0 ? 180 : 0; // south for N. Hemisphere, north for S. Hemisphere
+}
+
+/**
+ * Shadow-avoidance row pitch multiplier based on latitude.
+ * Represents total row pitch / panel depth (always ≥ 1).
+ * India ~20°N → ~1.7×; UK ~51°N → ~2.7×; equator → 1.2×
+ */
+function shadowRowPitchFactor(lat: number): number {
+  const absLat = Math.abs(lat);
+  // Winter solstice solar altitude at noon = 90 - lat - 23.5
+  const altitudeDeg = Math.max(5, 90 - absLat - 23.5);
+  const altRad = (altitudeDeg * Math.PI) / 180;
+  // Panel tilt ≈ 0.6 × latitude (typical for flat-roof mount) capped at 30°
+  const tiltDeg = Math.min(30, absLat * 0.6);
+  const tiltRad = (tiltDeg * Math.PI) / 180;
+  // Row pitch = panel_depth_projection + shadow_length + access_gap(0.3m)
+  const panelDepthProjection = Math.cos(tiltRad);
+  const shadowLength = Math.sin(tiltRad) / Math.tan(altRad);
+  return Math.max(1.2, panelDepthProjection + shadowLength + 0.3);
+}
+
 // ─── Panel SVG ────────────────────────────────────────────────────────────────
 
 function panelSvgInner(x: number, y: number, pW: number, pH: number): string {
@@ -330,14 +377,37 @@ function buildPanelSvg(
   panelCount: number,
   savingsText: string,
   capacityText: string,
-  polygon?: Array<{ x: number; y: number }> | null,
+  polygon: Array<{ x: number; y: number }> | null | undefined,
+  azimuth: number,
 ): Buffer {
   const scale = mpp(lat, ZOOM);
-  const pW    = Math.max(6, Math.round((PANEL_W_M   * VIS_SCALE) / scale));
-  const pH    = Math.max(4, Math.round((PANEL_H_M   * VIS_SCALE) / scale));
-  const gap   = Math.max(1, Math.round((PANEL_GAP_M * VIS_SCALE) / scale));
-  const cellW = pW + gap;
-  const cellH = pH + gap;
+
+  // Orient panels based on roof azimuth:
+  // E/W facing (azimuth 45-135° or 225-315°) → portrait (narrower E-W, taller N-S)
+  // N/S facing (default for flat roofs) → landscape (wider E-W, shallower N-S)
+  const azNorm = ((azimuth % 360) + 360) % 360;
+  const isEastWestFacing = (azNorm > 45 && azNorm < 135) || (azNorm > 225 && azNorm < 315);
+  const rawPW = isEastWestFacing ? PANEL_H_M : PANEL_W_M;
+  const rawPH = isEastWestFacing ? PANEL_W_M : PANEL_H_M;
+
+  const pW    = Math.max(6, Math.round((rawPW   * VIS_SCALE) / scale));
+  const pH    = Math.max(4, Math.round((rawPH   * VIS_SCALE) / scale));
+  const gapX  = Math.max(1, Math.round((PANEL_GAP_M * VIS_SCALE) / scale));
+  // Shadow-aware row gap: larger N-S spacing between rows to avoid inter-row shading
+  const rowPitch = shadowRowPitchFactor(lat);
+  const gapY  = Math.max(gapX, Math.round(((rawPH * rowPitch - rawPH) * VIS_SCALE) / scale));
+  const cellW = pW + gapX;
+  const cellH = pH + gapY;
+
+  // Sun direction label and arrow
+  const sunDir = lat >= 0 ? "South" : "North";
+  const sunArrowAngle = lat >= 0 ? 180 : 0;
+  const arrowX = CANVAS_W - 50;
+  const arrowY = HEADER_H + 30;
+  const arrowLen = 18;
+  const arrowRad = (sunArrowAngle * Math.PI) / 180;
+  const ax2 = arrowX + arrowLen * Math.sin(arrowRad);
+  const ay2 = arrowY + arrowLen * Math.cos(arrowRad);
 
   let panelsSvg = "";
   let count = 0;
@@ -347,16 +417,24 @@ function buildPanelSvg(
     panelsSvg += `<polygon points="${pts}" fill="rgba(59,130,246,0.08)"
       stroke="rgba(96,165,250,0.6)" stroke-width="1.5" stroke-dasharray="5 3"/>`;
 
-    for (let y = gap; y + pH < CANVAS_H - FOOTER_H; y += cellH) {
-      for (let x = gap; x + pW < CANVAS_W; x += cellW) {
+    // Fill polygon row by row from the sun-facing side
+    const startRow = lat >= 0
+      ? HEADER_H + gapY                   // Northern Hemisphere: top = north, fill from top
+      : CANVAS_H - FOOTER_H - pH - gapY;  // Southern Hemisphere: fill from bottom
+    const rowDir = lat >= 0 ? 1 : -1;
+
+    let rowY = startRow;
+    while (count < panelCount && rowY + pH < CANVAS_H - FOOTER_H && rowY >= HEADER_H) {
+      for (let x = gapX; x + pW < CANVAS_W; x += cellW) {
         if (count >= panelCount) break;
-        const pcx = x + pW / 2, pcy = y + pH / 2;
+        const pcx = x + pW / 2, pcy = rowY + pH / 2;
         if (ptInPoly(pcx, pcy, polygon) && pcy >= HEADER_H) {
-          panelsSvg += panelSvgInner(x, y, pW, pH);
+          panelsSvg += panelSvgInner(x, rowY, pW, pH);
           count++;
         }
       }
-      if (count >= panelCount) break;
+      rowY += cellH * rowDir;
+      if (lat < 0 && rowY < HEADER_H) break;
     }
   } else {
     panelsSvg += `<rect x="${bounds.x}" y="${bounds.y}" width="${bounds.w}" height="${bounds.h}"
@@ -368,8 +446,8 @@ function buildPanelSvg(
     const maxFit = cols * rows;
     count = Math.min(panelCount, maxFit);
 
-    const gridW  = cols * cellW - gap;
-    const gridH  = Math.ceil(count / cols) * cellH - gap;
+    const gridW  = cols * cellW - gapX;
+    const gridH  = Math.ceil(count / cols) * cellH - gapY;
     const startX = Math.round(bounds.x + (bounds.w - gridW) / 2);
     const startY = Math.round(bounds.y + (bounds.h - gridH) / 2);
 
@@ -389,6 +467,14 @@ function buildPanelSvg(
     ? "Panels on user-drawn rooftop"
     : "Rooftop auto-detected from satellite";
 
+  // Sun direction indicator (compass arrow)
+  const sunIndicator = `
+  <circle cx="${arrowX}" cy="${arrowY}" r="14" fill="rgba(0,0,0,0.55)" stroke="rgba(251,146,60,0.5)" stroke-width="1"/>
+  <line x1="${arrowX}" y1="${arrowY}" x2="${ax2}" y2="${ay2}"
+        stroke="#fb923c" stroke-width="2" stroke-linecap="round"/>
+  <text x="${arrowX}" y="${arrowY + 28}" font-family="Arial,sans-serif" font-size="8"
+        fill="#fb923c" text-anchor="middle">☀ ${sunDir}</text>`;
+
   return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${CANVAS_W}" height="${CANVAS_H}">
   <rect x="0" y="0" width="${CANVAS_W}" height="${HEADER_H}" fill="rgba(0,0,0,0.70)"/>
   <text x="14" y="22" font-family="Arial,sans-serif" font-size="13" font-weight="bold" fill="#fb923c">
@@ -398,12 +484,13 @@ function buildPanelSvg(
     Saves ${savingsText}/yr · ${label}
   </text>
   ${panelsSvg}
+  ${sunIndicator}
   <rect x="0" y="${CANVAS_H - FOOTER_H}" width="${CANVAS_W}" height="${FOOTER_H}" fill="rgba(0,0,0,0.72)"/>
   <text x="14" y="${CANVAS_H - 10}" font-family="Arial,sans-serif" font-size="10" font-weight="bold" fill="#fb923c">
     SolarPropose · Your building. Solar-ready.
   </text>
   <text x="${CANVAS_W - 14}" y="${CANVAS_H - 10}" font-family="Arial,sans-serif"
-        font-size="9" fill="#374151" text-anchor="end">© ESRI World Imagery</text>
+        font-size="9" fill="#374151" text-anchor="end">Panels face ${sunDir} · Optimal for this location</text>
 </svg>`);
 }
 
@@ -425,9 +512,12 @@ export interface VisualOptions {
 export async function buildVisualBuffer(opts: VisualOptions): Promise<Buffer> {
   const { lat, lng, roofAreaSqM, annualSavingsUsd, systemCapacityKw, rawSolarData, polygon } = opts;
 
-  const savingsText  = annualSavingsUsd
+  const savingsText = annualSavingsUsd
     ? `₹${Math.round(annualSavingsUsd).toLocaleString("en-IN")}`
     : "significant";
+
+  // Optimal azimuth from Solar API data (or latitude-based default)
+  const azimuth = getOptimalAzimuth(rawSolarData, lat);
 
   // 1. Fetch satellite image
   const satBuffer = await buildSatelliteBuffer(lat, lng);
@@ -435,21 +525,27 @@ export async function buildVisualBuffer(opts: VisualOptions): Promise<Buffer> {
   // 2. User-drawn polygon — most accurate, skip all detection
   if (polygon && polygon.length >= 3) {
     const canvasPoly = polygon.map(p => ({ x: p.x * CANVAS_W, y: p.y * CANVAS_H }));
-    // Count panels that fit in polygon at real scale
+    // Count panels using sun-direction-aware placement
+    const azNorm = ((azimuth % 360) + 360) % 360;
+    const isEW = (azNorm > 45 && azNorm < 135) || (azNorm > 225 && azNorm < 315);
+    const rawPW = isEW ? PANEL_H_M : PANEL_W_M;
+    const rawPH = isEW ? PANEL_W_M : PANEL_H_M;
     const scale = mpp(lat, ZOOM);
-    const pW  = Math.max(6, Math.round((PANEL_W_M * VIS_SCALE) / scale));
-    const pH  = Math.max(4, Math.round((PANEL_H_M * VIS_SCALE) / scale));
-    const gap = Math.max(1, Math.round((PANEL_GAP_M * VIS_SCALE) / scale));
+    const pW  = Math.max(6, Math.round((rawPW * VIS_SCALE) / scale));
+    const pH  = Math.max(4, Math.round((rawPH * VIS_SCALE) / scale));
+    const gapX = Math.max(1, Math.round((PANEL_GAP_M * VIS_SCALE) / scale));
+    const rowPitch = shadowRowPitchFactor(lat);
+    const gapY = Math.max(gapX, Math.round(((rawPH * rowPitch - rawPH) * VIS_SCALE) / scale));
     let polyPanels = 0;
-    for (let y = gap; y + pH < CANVAS_H - FOOTER_H; y += pH + gap) {
-      for (let x = gap; x + pW < CANVAS_W; x += pW + gap) {
+    for (let y = HEADER_H + gapY; y + pH < CANVAS_H - FOOTER_H; y += pH + gapY) {
+      for (let x = gapX; x + pW < CANVAS_W; x += pW + gapX) {
         if (ptInPoly(x + pW / 2, y + pH / 2, canvasPoly)) polyPanels++;
       }
     }
     const capacityText = polyPanels > 0
       ? `${((polyPanels * 400) / 1000).toFixed(1)} kW`
       : (systemCapacityKw ? `${systemCapacityKw.toFixed(1)} kW` : "");
-    const panelSvg = buildPanelSvg(lat, { x: 0, y: 0, w: 0, h: 0 }, polyPanels, savingsText, capacityText, canvasPoly);
+    const panelSvg = buildPanelSvg(lat, { x: 0, y: 0, w: 0, h: 0 }, polyPanels, savingsText, capacityText, canvasPoly, azimuth);
     return sharp(satBuffer).composite([{ input: panelSvg, top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
   }
 
@@ -463,17 +559,14 @@ export async function buildVisualBuffer(opts: VisualOptions): Promise<Buffer> {
   const bounds = apiSegmentBounds ?? detectedBounds;
 
   // 5. Panel count: prefer image-derived area → stored DB value
-  //    Image-derived is unique per building; DB value may be the generic 800sqm default
   const effectiveArea = estimatedAreaSqM ?? roofAreaSqM;
   const effectivePanelCount = effectiveArea != null
     ? panelsFromArea(effectiveArea)
     : opts.panelCount;
 
-  const capacityText = systemCapacityKw
-    ? `${((effectivePanelCount * 400) / 1000).toFixed(1)} kW`
-    : "";
+  const capacityText = `${((effectivePanelCount * 400) / 1000).toFixed(1)} kW`;
 
-  const panelSvg = buildPanelSvg(lat, bounds, effectivePanelCount, savingsText, capacityText, null);
+  const panelSvg = buildPanelSvg(lat, bounds, effectivePanelCount, savingsText, capacityText, null, azimuth);
   return sharp(satBuffer).composite([{ input: panelSvg, top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
 }
 
