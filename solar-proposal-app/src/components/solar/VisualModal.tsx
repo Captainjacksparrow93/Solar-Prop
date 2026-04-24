@@ -36,16 +36,6 @@ export function VisualModal({
 
   useEffect(() => { document.body.style.overflow = "hidden"; return () => { document.body.style.overflow = ""; }; }, []);
 
-  // Load default visual on mount if no existing URL
-  useEffect(() => {
-    if (!imageUrl && !triggerGenerate) {
-      setImageUrl(`/api/leads/${leadId}/visual`);
-    } else if (triggerGenerate && !imageUrl) {
-      generate();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const generate = useCallback(async () => {
     setGenerating(true);
     try {
@@ -55,6 +45,16 @@ export function VisualModal({
     } catch { /* silent */ }
     finally { setGenerating(false); }
   }, [leadId]);
+
+  // Load default visual on mount if no existing URL
+  useEffect(() => {
+    if (!imageUrl && !triggerGenerate) {
+      setImageUrl(`/api/leads/${leadId}/visual`);
+    } else if (triggerGenerate && !imageUrl) {
+      generate();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Called by RoofDrawingTool when user confirms their polygon
   function handlePolygonConfirmed(polygonNorm: Array<{ x: number; y: number }>, count: number) {
