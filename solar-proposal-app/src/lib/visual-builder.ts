@@ -159,29 +159,33 @@ async function detectRoof(
     return Math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2);
   }
 
-  // Sample 5×5 patch around centre for robust reference colour
+  function refColourAt(sx: number, sy: number): [number, number, number] {
+    let rS = 0, gS = 0, bS = 0, n = 0;
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const [r, g, b] = getRgb(
+          Math.max(0, Math.min(AW - 1, sx + dx)),
+          Math.max(0, Math.min(AH - 1, sy + dy)),
+        );
+        rS += r; gS += g; bS += b; n++;
+      }
+    }
+    return [rS / n, gS / n, bS / n];
+  }
+
   const cx = Math.floor(AW / 2);
   const cy = Math.floor(AH / 2);
-  let rS = 0, gS = 0, bS = 0, n = 0;
-  for (let dy = -2; dy <= 2; dy++) {
-    for (let dx = -2; dx <= 2; dx++) {
-      const [r, g, b] = getRgb(Math.max(0, Math.min(AW - 1, cx + dx)),
-                                Math.max(0, Math.min(AH - 1, cy + dy)));
-      rS += r; gS += g; bS += b; n++;
-    }
-  }
-  const ref: [number, number, number] = [rS / n, gS / n, bS / n];
 
-  function floodFill(tol: number) {
+  function floodFill(seedX: number, seedY: number, ref: [number, number, number], tol: number) {
     const visited = new Uint8Array(AW * AH);
     const q = new Int32Array(AW * AH);
     let qHead = 0, qTail = 0;
 
-    const startIdx = cy * AW + cx;
+    const startIdx = seedY * AW + seedX;
     visited[startIdx] = 1;
     q[qTail++] = startIdx;
 
-    let minX = cx, maxX = cx, minY = cy, maxY = cy;
+    let minX = seedX, maxX = seedX, minY = seedY, maxY = seedY;
     const DX = [-1, 1, 0, 0];
     const DY = [0, 0, -1, 1];
 
@@ -210,43 +214,61 @@ async function detectRoof(
 
   const scaleX = CANVAS_W / AW;
   const scaleY = CANVAS_H / AH;
-  // Each analysis pixel covers this many real-world metres (2× canvas scale)
   const analysisMpp = mpp(lat, ZOOM) * (CANVAS_W / AW);
 
-  for (const tol of [22, 38, 55]) {
-    const { minX, minY, maxX, maxY, count } = floodFill(tol);
-    const dw = maxX - minX;
-    const dh = maxY - minY;
+  // Multi-seed: centre + N/S/E/W offsets — pick the largest valid result so
+  // we don't fail when the centre pixel happens to land on a chimney/skylight.
+  const SEEDS: Array<[number, number]> = [
+    [cx, cy],
+    [cx, Math.floor(AH * 0.40)],
+    [cx, Math.floor(AH * 0.60)],
+    [Math.floor(AW * 0.40), cy],
+    [Math.floor(AW * 0.60), cy],
+  ];
 
-    if (dw < 8 || dh < 5) continue;
+  type Candidate = { bounds: RoofBounds; count: number };
+  let best: Candidate | null = null;
 
-    const ratio = (dw * dh) / (AW * AH);
-    if (ratio > 0.78) continue;
+  for (const [sx, sy] of SEEDS) {
+    const ref = refColourAt(sx, sy);
+    for (const tol of [22, 38, 55]) {
+      const { minX, minY, maxX, maxY, count } = floodFill(sx, sy, ref, tol);
+      const dw = maxX - minX;
+      const dh = maxY - minY;
+      if (dw < 8 || dh < 5) continue;
 
-    const rcx = (minX + maxX) / 2;
-    const rcy = (minY + maxY) / 2;
-    if (Math.abs(rcx - cx) > AW * 0.35 || Math.abs(rcy - cy) > AH * 0.35) continue;
+      const ratio = (dw * dh) / (AW * AH);
+      if (ratio > 0.78) continue;
 
-    const aspect = dw / Math.max(dh, 1);
-    if (aspect > 8 || aspect < 0.12) continue;
+      const rcx = (minX + maxX) / 2;
+      const rcy = (minY + maxY) / 2;
+      if (Math.abs(rcx - cx) > AW * 0.40 || Math.abs(rcy - cy) > AH * 0.40) continue;
 
-    const rx = Math.max(0,            (minX - 1) * scaleX);
-    const ry = Math.max(HEADER_H,     (minY - 1) * scaleY);
-    const rw = Math.min(CANVAS_W - rx,(dw + 2)   * scaleX);
-    const rh = Math.min(CANVAS_H - FOOTER_H - ry, (dh + 2) * scaleY);
+      const aspect = dw / Math.max(dh, 1);
+      if (aspect > 8 || aspect < 0.12) continue;
 
-    if (rw < 30 || rh < 20) continue;
+      const rx = Math.max(0,            (minX - 1) * scaleX);
+      const ry = Math.max(HEADER_H,     (minY - 1) * scaleY);
+      const rw = Math.min(CANVAS_W - rx,(dw + 2)   * scaleX);
+      const rh = Math.min(CANVAS_H - FOOTER_H - ry, (dh + 2) * scaleY);
+      if (rw < 30 || rh < 20) continue;
 
-    // Pixel count → real sq-m area (unique per building)
-    const estimatedAreaSqM = Math.round(count * analysisMpp * analysisMpp);
+      if (!best || count > best.count) {
+        best = {
+          bounds: { x: Math.round(rx), y: Math.round(ry), w: Math.round(rw), h: Math.round(rh) },
+          count,
+        };
+      }
+    }
+  }
 
+  if (best) {
     return {
-      bounds: { x: Math.round(rx), y: Math.round(ry), w: Math.round(rw), h: Math.round(rh) },
-      estimatedAreaSqM,
+      bounds: best.bounds,
+      estimatedAreaSqM: Math.round(best.count * analysisMpp * analysisMpp),
     };
   }
 
-  // Flood-fill failed — use hint area or generic centred rectangle
   return { bounds: fallbackBounds(lat, hintAreaSqM), estimatedAreaSqM: null };
 }
 
@@ -318,6 +340,54 @@ function projectSolarSegments(
 
   if (w < 20 || h < 10 || x < -w || y < -h || x > CANVAS_W || y > CANVAS_H) return null;
   return { x: Math.max(0, x), y: Math.max(HEADER_H, y), w, h };
+}
+
+// ─── OSM polygon → canvas pixels ─────────────────────────────────────────────
+
+/**
+ * Projects an OSM lat/lng building outline onto the 640×400 canvas so the
+ * panels are placed inside the building's *real* footprint, not a flood-fill
+ * approximation.
+ */
+function projectOsmGeometry(
+  lat: number,
+  lng: number,
+  geom: Array<{ lat: number; lng: number }>,
+): Array<{ x: number; y: number }> | null {
+  if (!geom || geom.length < 3) return null;
+
+  const centerTile = latLngToTileFloat(lat, lng, ZOOM);
+  const pts: Array<{ x: number; y: number }> = [];
+
+  for (const p of geom) {
+    const t = latLngToTileFloat(p.lat, p.lng, ZOOM);
+    pts.push({
+      x: CANVAS_W / 2 + (t.x - centerTile.x) * TILE_SIZE,
+      y: CANVAS_H / 2 + (t.y - centerTile.y) * TILE_SIZE,
+    });
+  }
+
+  // Reject polygon if the entire shape lies outside the canvas (e.g. coords
+  // mismatch between the named POI and its building).
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  if (maxX < 0 || minX > CANVAS_W || maxY < 0 || minY > CANVAS_H) return null;
+  if (maxX - minX < 20 || maxY - minY < 12) return null;
+
+  // Clip points to header/footer so panels can never overlap the overlay UI.
+  return pts.map(p => ({
+    x: Math.max(0, Math.min(CANVAS_W, p.x)),
+    y: Math.max(HEADER_H, Math.min(CANVAS_H - FOOTER_H, p.y)),
+  }));
+}
+
+function polygonPixelArea(poly: Array<{ x: number; y: number }>): number {
+  let a = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    a += (poly[j].x + poly[i].x) * (poly[j].y - poly[i].y);
+  }
+  return Math.abs(a / 2);
 }
 
 // ─── Sun direction helpers ────────────────────────────────────────────────────
@@ -507,10 +577,12 @@ export interface VisualOptions {
   systemCapacityKw?: number | null;
   rawSolarData?: unknown;
   polygon?: NormPoint[] | null;
+  /** OSM building outline (lat/lng) — used to draw panels on the actual roof shape. */
+  osmGeometry?: Array<{ lat: number; lng: number }> | null;
 }
 
 export async function buildVisualBuffer(opts: VisualOptions): Promise<Buffer> {
-  const { lat, lng, roofAreaSqM, annualSavingsUsd, systemCapacityKw, rawSolarData, polygon } = opts;
+  const { lat, lng, roofAreaSqM, annualSavingsUsd, systemCapacityKw, rawSolarData, polygon, osmGeometry } = opts;
 
   const savingsText = annualSavingsUsd
     ? `₹${Math.round(annualSavingsUsd).toLocaleString("en-IN")}`
@@ -549,16 +621,37 @@ export async function buildVisualBuffer(opts: VisualOptions): Promise<Buffer> {
     return sharp(satBuffer).composite([{ input: panelSvg, top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
   }
 
-  // 3. Try Solar API segment bounds (most precise when available)
+  // 3. Prefer OSM building polygon (precise per-building shape) when present
+  const projectedOsm = osmGeometry ? projectOsmGeometry(lat, lng, osmGeometry) : null;
+  if (projectedOsm) {
+    // Real building footprint area in m² from canvas-projected polygon
+    const pixelArea = polygonPixelArea(projectedOsm);
+    const mppNow = mpp(lat, ZOOM);
+    const polyAreaSqM = pixelArea * mppNow * mppNow;
+    const effectiveArea = roofAreaSqM ?? polyAreaSqM;
+    const effectivePanelCount = panelsFromArea(effectiveArea);
+
+    const capacityText = `${((effectivePanelCount * 400) / 1000).toFixed(1)} kW`;
+    const panelSvg = buildPanelSvg(
+      lat,
+      { x: 0, y: 0, w: 0, h: 0 },
+      effectivePanelCount,
+      savingsText,
+      capacityText,
+      projectedOsm,
+      azimuth,
+    );
+    return sharp(satBuffer).composite([{ input: panelSvg, top: 0, left: 0 }]).jpeg({ quality: 90 }).toBuffer();
+  }
+
+  // 4. Try Solar API segment bounds (most precise when available)
   const apiSegmentBounds = projectSolarSegments(lat, lng, rawSolarData as Record<string, unknown> | null);
 
-  // 4. Run per-building roof detection from satellite pixels
+  // 5. Run per-building roof detection from satellite pixels
   const { bounds: detectedBounds, estimatedAreaSqM } = await detectRoof(satBuffer, lat, roofAreaSqM ?? null);
 
-  // Pick best bounds
   const bounds = apiSegmentBounds ?? detectedBounds;
 
-  // 5. Panel count: prefer image-derived area → stored DB value
   const effectiveArea = estimatedAreaSqM ?? roofAreaSqM;
   const effectivePanelCount = effectiveArea != null
     ? panelsFromArea(effectiveArea)

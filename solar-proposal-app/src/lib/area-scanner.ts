@@ -24,6 +24,10 @@ export interface PlaceResult {
   businessType: string | null;
   rating: number | null;
   totalRatings: number | null;
+  /** Real building footprint area in m² (from OSM polygon when available). */
+  roofAreaSqM?: number | null;
+  /** OSM building outline as ordered lat/lng points — used for accurate visual rendering. */
+  osmGeometry?: Array<{ lat: number; lng: number }> | null;
 }
 
 interface LatLng { lat: number; lng: number }
@@ -295,7 +299,7 @@ function buildQuery(center: LatLng, radiusMeters: number, maxResults: number, qu
   way["residential"="apartments"]${around};
   node["residential"="apartments"]${around};
 );
-out center body qt ${maxResults * 2};`;
+out geom center qt ${maxResults * 2};`;
   }
 
   const EXCL = "house|residential|apartments|detached|semidetached_house|terrace|bungalow|hut|shed|garage|garages|carport|cabin|dormitory|farm|allotment_house|static_caravan";
@@ -332,7 +336,29 @@ out center body qt ${maxResults * 2};`;
   way["office"]${around};
   node["office"]${around};`;
 
-  return `[out:json][timeout:45];\n(\n${targeted}\n${broad}\n);\nout center body qt ${maxResults * 2};`;
+  return `[out:json][timeout:45];\n(\n${targeted}\n${broad}\n);\nout geom center qt ${maxResults * 2};`;
+}
+
+// ─── OSM polygon → real-world footprint area (shoelace, equirectangular) ─────
+
+/**
+ * Computes the area of a closed lat/lng polygon in m².
+ * Uses an equirectangular projection accurate to ~0.5% for buildings <1 km wide.
+ */
+function polygonAreaSqM(points: Array<{ lat: number; lng: number }>): number {
+  if (points.length < 3) return 0;
+  const meanLat = points.reduce((s, p) => s + p.lat, 0) / points.length;
+  const cosLat = Math.cos((meanLat * Math.PI) / 180);
+  const M_PER_DEG = 111320;
+  const xy = points.map(p => ({
+    x: p.lng * M_PER_DEG * cosLat,
+    y: p.lat * M_PER_DEG,
+  }));
+  let area2 = 0;
+  for (let i = 0, j = xy.length - 1; i < xy.length; j = i++) {
+    area2 += (xy[j].x + xy[i].x) * (xy[j].y - xy[i].y);
+  }
+  return Math.abs(area2 / 2);
 }
 
 // ─── Parse Overpass elements → PlaceResult ────────────────────────────────────
@@ -351,6 +377,20 @@ function parseElements(elements: any[]): PlaceResult[] {
     seen.add(key);
 
     const tags = el.tags ?? {};
+
+    // OSM way `geometry` = ordered list of node lat/lng. Compute real footprint.
+    let osmGeometry: Array<{ lat: number; lng: number }> | null = null;
+    let roofAreaSqM: number | null = null;
+    if (Array.isArray(el.geometry) && el.geometry.length >= 3) {
+      osmGeometry = el.geometry
+        .map((g: { lat: number; lon: number }) => ({ lat: g.lat, lng: g.lon }))
+        .filter((p: { lat: number; lng: number }) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+      if (osmGeometry && osmGeometry.length >= 3) {
+        const a = polygonAreaSqM(osmGeometry);
+        // Sanity bounds — reject obviously bad polygons (parking lots, blocks)
+        if (a >= 30 && a <= 200000) roofAreaSqM = Math.round(a);
+      }
+    }
 
     const name =
       tags.name ??
@@ -382,6 +422,8 @@ function parseElements(elements: any[]): PlaceResult[] {
       businessType: buildingType.charAt(0).toUpperCase() + buildingType.slice(1),
       rating: null,
       totalRatings: null,
+      roofAreaSqM,
+      osmGeometry,
     });
   }
 
@@ -561,6 +603,46 @@ export async function scanFromCsv(csvText: string, maxResults = 100): Promise<Pl
     });
   }
   return results;
+}
+
+// ─── Reverse OSM lookup — find building polygon at a coord ──────────────────
+
+/**
+ * Given a lat/lng (typically from Google Places or a CSV row), find the
+ * underlying OSM building polygon and return its real footprint area.
+ * Used so non-OSM-sourced leads also get per-building dynamic calculations.
+ */
+export async function lookupOsmBuildingAt(
+  lat: number,
+  lng: number,
+): Promise<{ roofAreaSqM: number; osmGeometry: Array<{ lat: number; lng: number }> } | null> {
+  // Search a 40 m radius — buildings rarely have centroids further than this
+  // from their named POI marker.
+  const query = `[out:json][timeout:25];
+(
+  way(around:40,${lat},${lng})["building"];
+);
+out geom 5;`;
+
+  const elements = await queryOverpass(query);
+  if (elements.length === 0) return null;
+
+  let best: { roofAreaSqM: number; osmGeometry: Array<{ lat: number; lng: number }> } | null = null;
+
+  for (const el of elements) {
+    if (!Array.isArray(el.geometry) || el.geometry.length < 3) continue;
+    const geom = el.geometry
+      .map((g: { lat: number; lon: number }) => ({ lat: g.lat, lng: g.lon }))
+      .filter((p: { lat: number; lng: number }) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    if (geom.length < 3) continue;
+    const a = polygonAreaSqM(geom);
+    if (a < 30 || a > 200000) continue;
+    if (!best || a > best.roofAreaSqM) {
+      best = { roofAreaSqM: Math.round(a), osmGeometry: geom };
+    }
+  }
+
+  return best;
 }
 
 function isInsidePolygon(point: LatLng, polygon: LatLng[]): boolean {

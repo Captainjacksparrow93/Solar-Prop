@@ -47,8 +47,11 @@ export async function POST(req: NextRequest) {
     // Upsert leads — reset ALL scoring fields so re-scanned buildings get
     // re-analysed. Without this, old roofScore values exclude them from the
     // scoring phase (score route queries WHERE roofScore IS NULL).
-    await Promise.all(places.map(p =>
-      db.lead.upsert({
+    // Also pre-seed SolarAnalysis.roofAreaSqM with the OSM footprint so each
+    // building's calculations are unique to its actual roof size — not the
+    // generic 800 m² fallback.
+    await Promise.all(places.map(async p => {
+      const lead = await db.lead.upsert({
         where: { placeId: p.placeId },
         update: {
           scanJobId:      job.id,
@@ -58,7 +61,6 @@ export async function POST(req: NextRequest) {
           solarScore:     null,
           roofScoreLabel: null,
           animationUrl:   null,
-          // Refresh location & contact info in case OSM data changed
           businessName:  p.businessName,
           address:       p.address,
           city:          p.city,
@@ -88,8 +90,23 @@ export async function POST(req: NextRequest) {
           lng:          p.lng,
           status:       "NEW",
         },
-      })
-    ));
+      });
+
+      if (p.roofAreaSqM && p.roofAreaSqM > 0) {
+        await db.solarAnalysis.upsert({
+          where:  { leadId: lead.id },
+          create: {
+            leadId:      lead.id,
+            roofAreaSqM: p.roofAreaSqM,
+            panelLayout: (p.osmGeometry ? { osmGeometry: p.osmGeometry } : undefined) as never,
+          },
+          update: {
+            roofAreaSqM: p.roofAreaSqM,
+            panelLayout: (p.osmGeometry ? { osmGeometry: p.osmGeometry } : undefined) as never,
+          },
+        });
+      }
+    }));
 
     await db.scanJob.update({
       where: { id: job.id },

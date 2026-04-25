@@ -25,6 +25,12 @@ export async function GET(
     return new NextResponse("Lead not found or has no coordinates", { status: 404 });
   }
 
+  // OSM building outline (saved by scan/start and score route under panelLayout).
+  const layout = lead.solarAnalysis?.panelLayout as
+    | { osmGeometry?: Array<{ lat: number; lng: number }> }
+    | null;
+  const osmGeometry = layout?.osmGeometry ?? null;
+
   try {
     const buffer = await buildVisualBuffer({
       lat: lead.lat,
@@ -35,6 +41,7 @@ export async function GET(
       systemCapacityKw: lead.solarAnalysis?.systemCapacityKw ?? null,
       rawSolarData: lead.solarAnalysis?.rawSolarData ?? null,
       polygon,
+      osmGeometry,
     });
 
     // Cache for 1 hour (not 24h) so re-analyzed buildings get fresh visuals quickly.

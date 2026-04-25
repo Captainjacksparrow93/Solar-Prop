@@ -9,6 +9,7 @@ import { getDefaultUserId } from "@/lib/default-user";
 import { getBuildingInsights, estimateSolarFromCoords, panelsFromArea } from "@/lib/google-solar";
 import { calculateSolarFinancials } from "@/lib/proposal-calculator";
 import { normaliseBatch } from "@/lib/roof-scorer";
+import { lookupOsmBuildingAt } from "@/lib/area-scanner";
 
 export const maxDuration = 60;
 
@@ -27,6 +28,7 @@ export async function POST(
     where: { scanJobId: jobId, roofScore: null, lat: { not: null }, lng: { not: null } },
     take: BATCH,
     orderBy: { createdAt: "asc" },
+    include: { solarAnalysis: true },
   });
 
   const remaining = await db.lead.count({
@@ -57,13 +59,36 @@ export async function POST(
 
   for (const lead of unscored) {
     try {
-      // ── Try Google Solar API; fall back to estimate on any failure ─────────
+      // Pre-seeded OSM footprint area + polygon (saved during scan/start)
+      let preArea = lead.solarAnalysis?.roofAreaSqM ?? null;
+      const layout = lead.solarAnalysis?.panelLayout as { osmGeometry?: Array<{ lat: number; lng: number }> } | null;
+      let osmGeometry = layout?.osmGeometry ?? null;
+
+      // For non-OSM leads (Google Places, CSV) try a quick reverse OSM lookup
+      // so every building still gets a real footprint instead of generic 800 m².
+      if (!preArea) {
+        const osm = await lookupOsmBuildingAt(lead.lat!, lead.lng!).catch(() => null);
+        if (osm) {
+          preArea = osm.roofAreaSqM;
+          osmGeometry = osm.osmGeometry;
+        }
+      }
+
+      // ── Try Google Solar API; fall back to per-building OSM-derived area ──
       let solarData;
       try {
         solarData = await getBuildingInsights(lead.lat!, lead.lng!);
+        // Solar API can return tiny stats for unknown buildings — prefer the
+        // OSM footprint if it's substantially larger.
+        if (preArea && (!solarData.roofAreaSqM || preArea > solarData.roofAreaSqM * 1.3)) {
+          solarData = {
+            ...solarData,
+            roofAreaSqM: preArea,
+            maxPanelCount: panelsFromArea(preArea),
+          };
+        }
       } catch {
-        // Fallback: estimate from lat/lng with default commercial roof area
-        solarData = estimateSolarFromCoords(lead.lat!, lead.lng!);
+        solarData = estimateSolarFromCoords(lead.lat!, lead.lng!, preArea ?? 800);
       }
 
       // Panel count from roof area (no artificial 50/200 cap)
@@ -94,6 +119,9 @@ export async function POST(
         roiPercent:           financials.roiPercent,
         co2OffsetTonsPerYear: financials.co2OffsetTonsPerYear,
         rawSolarData:         solarData.rawData as never,
+        // Preserve the OSM polygon so the visual builder can draw the exact
+        // roof shape without re-running flood-fill heuristics.
+        panelLayout: (osmGeometry ? { osmGeometry } : undefined) as never,
       };
 
       await db.solarAnalysis.upsert({
