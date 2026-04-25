@@ -40,6 +40,7 @@ interface ScanLead {
     paybackYears: number | null;
     roiPercent: number | null;
     usableSunshineHoursPerYear: number | null;
+    panelLayout: unknown;
   } | null;
 }
 
@@ -621,18 +622,27 @@ export function LiveActivityDashboard({ jobId, jobName, jobStatus, initialLeads 
       </div>
 
       {/* ── Visual Modal ── */}
-      {modal && (
+      {modal && (() => {
+        const mLead = leads.find(l => l.id === modal.leadId);
+        const mLayout = mLead?.solarAnalysis?.panelLayout as any;
+        const mOsm = mLayout?.osmGeometry ?? null;
+        return (
         <VisualModal
           leadId={modal.leadId}
           leadName={modal.leadName}
-          lat={leads.find(l => l.id === modal.leadId)?.lat}
-          lng={leads.find(l => l.id === modal.leadId)?.lng}
-          panelCount={leads.find(l => l.id === modal.leadId)?.solarAnalysis?.panelCount ?? 20}
+          lat={mLead?.lat}
+          lng={mLead?.lng}
+          panelCount={mLead?.solarAnalysis?.panelCount ?? 20}
+          roofAreaSqM={mLead?.solarAnalysis?.roofAreaSqM}
+          annualSavingsUsd={mLead?.solarAnalysis?.annualSavingsUsd}
+          osmGeometry={mOsm}
+          initialLayout={mLead?.solarAnalysis?.panelLayout}
           existingUrl={modal.url}
           triggerGenerate={modal.generate}
           onClose={() => { setModal(null); refresh(); }}
         />
-      )}
+        );
+      })()}
     </div>
   );
 }
