@@ -401,6 +401,9 @@ export function LeadDetailClient({ lead, company }: Props) {
               lat={lead.lat}
               lng={lead.lng}
               panelCount={analysis.panelCount ?? panelCount ?? 20}
+              roofAreaSqM={analysis.roofAreaSqM}
+              annualSavingsUsd={analysis.annualSavingsUsd}
+              osmGeometry={(analysis.panelLayout as any)?.osmGeometry ?? null}
               initialLayout={analysis.panelLayout}
               uploadedImageUrl={uploadedImageUrl ?? undefined}
             />
